@@ -337,6 +337,14 @@ function LoginScreen({ users, onLogin }) {
 export default function App() {
   const saved = loadState();
 
+// ===== Cloud sync (STEG 5) =====
+const cloudHydratedRef = useRef(false);
+const cloudSaveDebounceRef = useRef(createDebouncer(900));
+const [cloudStatus, setCloudStatus] = useState({
+  loading: false,
+  lastSync: "",
+});
+
   /* ===== Auth/User state ===== */
   const [users, setUsers] = useState(() => {
     const base =
@@ -577,26 +585,60 @@ export default function App() {
 
     closeAddProd();
   };
+/* ===== ✅ STEG 5.1: Hämta state från Vercel KV ===== */
+useEffect(() => {
+  let cancelled = false;
 
-  /* ===== Persist ALL state ===== */
-  useEffect(() => {
-    saveState({
-      vy,
-      users,
-      currentUser,
-      produkter,
-      inkopslista,
-      onskemal,
-      historik,
-      lagLager,
-      aktivtLag,
-      recentComments,
-      qtyMap,
-      leveransKommentar,
-      leveransLagerplats,
-      leveransQtyMap,
-    });
-  }, [
+  (async () => {
+    try {
+      setCloudStatus((s) => ({ ...s, loading: true }));
+
+      const res = await fetch(CLOUD_GET_URL);
+      const data = await res.json();
+
+      if (cancelled) return;
+
+      if (data?.ok && data?.payload) {
+        const p = data.payload;
+
+        if (Array.isArray(p.users)) setUsers(p.users);
+        if (p.currentUser) setCurrentUser(p.currentUser);
+
+        if (typeof p.vy === "string") setVy(p.vy);
+        if (Array.isArray(p.produkter)) setProdukter(p.produkter);
+        if (Array.isArray(p.inkopslista)) setInkopslista(p.inkopslista);
+        if (Array.isArray(p.onskemal)) setOnskemal(p.onskemal);
+        if (Array.isArray(p.historik)) setHistorik(p.historik);
+        if (Array.isArray(p.lagLager)) setLagLager(p.lagLager);
+
+        if (typeof p.aktivtLag === "string") setAktivtLag(p.aktivtLag);
+        if (Array.isArray(p.recentComments)) setRecentComments(p.recentComments);
+        if (p.qtyMap) setQtyMap(p.qtyMap);
+
+        cloudHydratedRef.current = true;
+        setCloudStatus({
+          loading: false,
+          lastSync: p.__meta?.updatedAt || new Date().toISOString(),
+        });
+      } else {
+        cloudHydratedRef.current = true;
+        setCloudStatus((s) => ({ ...s, loading: false }));
+      }
+    } catch (e) {
+      cloudHydratedRef.current = true;
+      setCloudStatus((s) => ({ ...s, loading: false }));
+      console.warn("Cloud load failed:", e);
+    }
+  })();
+
+  return () => {
+    cancelled = true;
+  };
+}, []);
+
+/* ===== Persist ALL state (local + cloud) ===== */
+useEffect(() => {
+  const payload = {
     vy,
     users,
     currentUser,
@@ -611,7 +653,42 @@ export default function App() {
     leveransKommentar,
     leveransLagerplats,
     leveransQtyMap,
-  ]);
+  };
+
+  // Local fallback
+  saveState(payload);
+
+  // Cloud sync
+  if (!cloudHydratedRef.current) return;
+
+  cloudSaveDebounceRef.current(async () => {
+    try {
+      await fetch(CLOUD_SET_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ payload }),
+      });
+      setCloudStatus((s) => ({ ...s, lastSync: new Date().toISOString() }));
+    } catch (e) {
+      console.warn("Cloud save failed:", e);
+    }
+  });
+}, [
+  vy,
+  users,
+  currentUser,
+  produkter,
+  inkopslista,
+  onskemal,
+  historik,
+  lagLager,
+  aktivtLag,
+  recentComments,
+  qtyMap,
+  leveransKommentar,
+  leveransLagerplats,
+  leveransQtyMap,
+]);
 
   /* ===== View guarding ===== */
   useEffect(() => {
