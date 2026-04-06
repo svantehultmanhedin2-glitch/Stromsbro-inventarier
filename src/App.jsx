@@ -63,6 +63,11 @@ function saveState(state) {
   } catch {}
 }
 
+
+/* ================= Cloud API URLs ================= */
+const CLOUD_GET_URL = "/api/state/get";
+const CLOUD_SET_URL = "/api/state/set";
+
 /* ================= Utils ================= */
 function normalizeHeader(h) {
   return String(h ?? "")
