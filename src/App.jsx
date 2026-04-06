@@ -166,7 +166,7 @@ function buildInkopLista(produkter, prevList = []) {
         onskemalAv: prev?.onskemalAv ?? "",
         onskemalKommentar: prev?.onskemalKommentar ?? "",
 
-        // ✅ Inleveransdata
+        // Inleveransdata
         mottagetAntal: Math.max(0, toInt(prev?.mottagetAntal, 0)),
         levererad: prev?.levererad === true,
         levereradTid: prev?.levereradTid ?? "",
@@ -255,7 +255,7 @@ function useToast(timeoutMs = 2500) {
   return { info, show, setInfo };
 }
 
-/* ================= Login Screen (render-only) ================= */
+/* ================= Login Screen ================= */
 function LoginScreen({ users, onLogin }) {
   const [username, setUsername] = useState(users?.[0]?.username ?? "");
   const [pin, setPin] = useState("");
@@ -479,6 +479,105 @@ export default function App() {
     kommentar: "",
   });
 
+  /* ===== ✅ NY PRODUKT (Huvudlager) ===== */
+  const [addProdOpen, setAddProdOpen] = useState(false);
+  const [newProd, setNewProd] = useState({
+    huvudgrupp: "",
+    produkt: "",
+    lagerplats: "Huvudförråd",
+    antal: 0,
+    minAntal: 0,
+    beställningspunkt: 0,
+  });
+
+  const openAddProd = () => {
+    setFel("");
+    setNewProd({
+      huvudgrupp: "",
+      produkt: "",
+      lagerplats: "Huvudförråd",
+      antal: 0,
+      minAntal: 0,
+      beställningspunkt: 0,
+    });
+    setAddProdOpen(true);
+  };
+  const closeAddProd = () => setAddProdOpen(false);
+
+  const sparaNyProdukt = () => {
+    if (!canEditHuvudlager) return;
+
+    const produktNamn = String(newProd.produkt || "").trim();
+    if (!produktNamn) {
+      setFel("Produktnamn krävs.");
+      return;
+    }
+
+    const huvudgrupp = String(newProd.huvudgrupp || "").trim();
+    const lagerplats = String(newProd.lagerplats || "").trim() || "Huvudförråd";
+
+    const antal = Math.max(0, toInt(newProd.antal, 0));
+    const minAntal = Math.max(0, toInt(newProd.minAntal, 0));
+    const beställningspunkt = Math.max(0, toInt(newProd.beställningspunkt, 0));
+
+    const idx = produkter.findIndex(
+      (p) => normKeyPart(p.produkt) === normKeyPart(produktNamn) && normKeyPart(p.huvudgrupp) === normKeyPart(huvudgrupp)
+    );
+
+    let nyaProdukter;
+
+    if (idx >= 0) {
+      // Finns redan -> slå ihop: öka antal + uppdatera fält
+      nyaProdukter = produkter.map((p, i) =>
+        i !== idx
+          ? p
+          : {
+              ...p,
+              produkt: produktNamn,
+              huvudgrupp,
+              lagerplats,
+              antal: Math.max(0, toInt(p.antal, 0)) + antal,
+              minAntal,
+              beställningspunkt,
+            }
+      );
+      showInfo("Produkten fanns redan – ökade antal och uppdaterade uppgifter.");
+    } else {
+      // Skapa ny
+      const ny = {
+        id: Date.now(),
+        huvudgrupp,
+        produkt: produktNamn,
+        antal,
+        lagerplats,
+        minAntal,
+        beställningspunkt,
+      };
+      nyaProdukter = [ny, ...produkter];
+      showInfo("Ny produkt skapad.");
+    }
+
+    setFel("");
+    setProdukter(nyaProdukter);
+    setInkopslista((prev) => buildInkopLista(nyaProdukter, prev));
+
+    setHistorik((prev) => [
+      {
+        tid: new Date().toLocaleString("sv-SE"),
+        typ: idx >= 0 ? "Produkt uppdaterad" : "Ny produkt",
+        produkt: produktNamn,
+        huvudgrupp,
+        lagerplats,
+        antal,
+        användare: currentUser?.name ?? "Okänd",
+        kommentar: idx >= 0 ? "Sammanslagen rad (ökade antal)." : "Skapad i huvudlager.",
+      },
+      ...prev,
+    ]);
+
+    closeAddProd();
+  };
+
   /* ===== Persist ALL state ===== */
   useEffect(() => {
     saveState({
@@ -560,7 +659,7 @@ export default function App() {
     return Array.from(set).filter(Boolean).sort();
   }, [lagLager]);
 
-  const aktivtLagEff = isLedare ? (currentUser?.lag ?? "Okänt") : aktivtLag;
+  const aktivtLagEff = isLedare ? currentUser?.lag ?? "Okänt" : aktivtLag;
 
   const lagRaderVisning = useMemo(() => {
     const q = sok.trim().toLowerCase();
@@ -1006,7 +1105,9 @@ export default function App() {
 
   /* ================= Inköp ================= */
   const sättInköpsantalManuellt = (key, value) => {
-    setInkopslista((prev) => prev.map((r) => (r.key === key ? { ...r, antal: Math.max(0, toInt(value, 0)), manuell: true } : r)));
+    setInkopslista((prev) =>
+      prev.map((r) => (r.key === key ? { ...r, antal: Math.max(0, toInt(value, 0)), manuell: true } : r))
+    );
   };
   const återställRekommenderat = (key) => {
     setInkopslista((prev) => prev.map((r) => (r.key === key ? { ...r, antal: r.rekommenderat, manuell: false } : r)));
@@ -1036,109 +1137,107 @@ export default function App() {
   };
 
   /* ================= Inleverans: motta delleverans ================= */
-const mottaLeverans = (rowKey, qtyInput) => {
-  if (!canSeeInleverans) return;
+  const mottaLeverans = (rowKey, qtyInput) => {
+    if (!canSeeInleverans) return;
 
-  const row = inkopslista.find((r) => r.key === rowKey);
-  if (!row || !row.bestalld) {
-    setFel("Välj en beställd rad.");
-    return;
-  }
-
-  const ordered = Math.max(0, toInt(row.antal, 0));
-  const received = Math.max(0, toInt(row.mottagetAntal, 0));
-  const kvar = Math.max(0, ordered - received);
-
-  const qtyReq = Math.max(1, toInt(qtyInput, 1));
-  const qty = Math.min(kvar, qtyReq);
-  if (qty <= 0) {
-    setFel("Inget kvar att ta emot.");
-    return;
-  }
-
-  setFel("");
-  const tid = new Date().toLocaleString("sv-SE");
-  const av = currentUser?.name ?? "Okänd";
-  const kom = String(leveransKommentar ?? "").trim();
-
-  /* ✅ 1. Uppdatera HUVUDLAGER – EN gång */
-  setProdukter((prev) => {
-    const idx = prev.findIndex(
-      (p) =>
-        normKeyPart(p.produkt) === normKeyPart(row.produkt) &&
-        normKeyPart(p.huvudgrupp) === normKeyPart(row.huvudgrupp)
-    );
-
-    if (idx >= 0) {
-      const nya = [...prev];
-      nya[idx] = {
-        ...nya[idx],
-        antal: Math.max(0, toInt(nya[idx].antal, 0)) + qty,
-        lagerplats: leveransLagerplats,
-      };
-      return nya;
+    const row = inkopslista.find((r) => r.key === rowKey);
+    if (!row || !row.bestalld) {
+      setFel("Välj en beställd rad.");
+      return;
     }
 
-    return [
+    const ordered = Math.max(0, toInt(row.antal, 0));
+    const received = Math.max(0, toInt(row.mottagetAntal, 0));
+    const kvar = Math.max(0, ordered - received);
+
+    const qtyReq = Math.max(1, toInt(qtyInput, 1));
+    const qty = Math.min(kvar, qtyReq);
+    if (qty <= 0) {
+      setFel("Inget kvar att ta emot.");
+      return;
+    }
+
+    setFel("");
+    const tid = new Date().toLocaleString("sv-SE");
+    const av = currentUser?.name ?? "Okänd";
+    const kom = String(leveransKommentar ?? "").trim();
+
+    // 1) Uppdatera Huvudlager (en gång)
+    setProdukter((prev) => {
+      const idx = prev.findIndex(
+        (p) => normKeyPart(p.produkt) === normKeyPart(row.produkt) && normKeyPart(p.huvudgrupp) === normKeyPart(row.huvudgrupp)
+      );
+
+      if (idx >= 0) {
+        const nya = [...prev];
+        nya[idx] = {
+          ...nya[idx],
+          antal: Math.max(0, toInt(nya[idx].antal, 0)) + qty,
+          lagerplats: leveransLagerplats,
+        };
+        return nya;
+      }
+
+      return [
+        {
+          id: Date.now(),
+          huvudgrupp: row.huvudgrupp ?? "",
+          produkt: row.produkt ?? "",
+          antal: qty,
+          lagerplats: leveransLagerplats,
+          minAntal: 0,
+          beställningspunkt: 0,
+        },
+        ...prev,
+      ];
+    });
+
+    // 2) Uppdatera inköpsrad (utan rebuild)
+    setInkopslista((prev) =>
+      prev.map((r) => {
+        if (r.key !== rowKey) return r;
+
+        const newReceived = received + qty;
+        const fully = ordered > 0 && newReceived >= ordered;
+
+        return {
+          ...r,
+          mottagetAntal: newReceived,
+          levererad: fully,
+          levereradTid: fully ? tid : r.levereradTid,
+          levereradAv: fully ? av : r.levereradAv,
+          leveranser: [
+            {
+              tid,
+              av,
+              antal: qty,
+              lagerplats: leveransLagerplats,
+              kommentar: kom,
+            },
+            ...(r.leveranser || []),
+          ],
+        };
+      })
+    );
+
+    // 3) Historik
+    const kommentarText = `Inleverans → ${leveransLagerplats}${kom ? ` • ${kom}` : ""}`;
+    setHistorik((prev) => [
       {
-        id: Date.now(),
-        huvudgrupp: row.huvudgrupp ?? "",
-        produkt: row.produkt ?? "",
-        antal: qty,
+        tid,
+        typ: "Inleverans (beställning)",
+        produkt: row.produkt,
+        huvudgrupp: row.huvudgrupp,
         lagerplats: leveransLagerplats,
-        minAntal: 0,
-        beställningspunkt: 0,
+        antal: qty,
+        användare: av,
+        kommentar: kommentarText,
       },
       ...prev,
-    ];
-  });
+    ]);
 
-  /* ✅ 2. Uppdatera INKÖPSRAD – UTAN rebuild */
-  setInkopslista((prev) =>
-    prev.map((r) => {
-      if (r.key !== rowKey) return r;
-
-      const newReceived = received + qty;
-      const fully = ordered > 0 && newReceived >= ordered;
-
-      return {
-        ...r,
-        mottagetAntal: newReceived,
-        levererad: fully,
-        levereradTid: fully ? tid : r.levereradTid,
-        levereradAv: fully ? av : r.levereradAv,
-        leveranser: [
-          {
-            tid,
-            av,
-            antal: qty,
-            lagerplats: leveransLagerplats,
-            kommentar: kom,
-          },
-          ...(r.leveranser || []),
-        ],
-      };
-    })
-  );
-
-  /* ✅ 3. Historik */
-  const kommentarText = `Inleverans → ${leveransLagerplats}${kom ? ` • ${kom}` : ""}`;
-  setHistorik((prev) => [
-    {
-      tid,
-      typ: "Inleverans (beställning)",
-      produkt: row.produkt,
-      huvudgrupp: row.huvudgrupp,
-      lagerplats: leveransLagerplats,
-      antal: qty,
-      användare: av,
-      kommentar: kommentarText,
-    },
-    ...prev,
-  ]);
-
-  showInfo(`Tog emot ${qty} st: ${row.produkt}`);
-};
+    showInfo(`Tog emot ${qty} st: ${row.produkt}`);
+  };
 
   /* ================= Admin: användare + PIN ================= */
   const [userDraft, setUserDraft] = useState({ name: "", username: "", role: "Ledare", lag: "P12", pin: "" });
@@ -1557,6 +1656,24 @@ const mottaLeverans = (rowKey, qtyInput) => {
                     </div>
                   ) : null}
 
+                  {/* ✅ NY: Lägg till produkt under Lager */}
+                  {canEditHuvudlager && !selectMode ? (
+                    <section className="card" style={{ marginBottom: 12 }}>
+                      <div className="card__top">
+                        <div className="card__title">➕ Lägg till produkt</div>
+                        <Pill tone="neutral">Huvudlager</Pill>
+                      </div>
+                      <div className="muted" style={{ marginTop: 8 }}>
+                        Skapa ny artikel i huvudlagret (påverkar inköp automatiskt).
+                      </div>
+                      <div className="btnRow" style={{ marginTop: 10, gridTemplateColumns: "1fr" }}>
+                        <PrimaryButton tone="primary" onClick={openAddProd}>
+                          ➕ Ny produkt
+                        </PrimaryButton>
+                      </div>
+                    </section>
+                  ) : null}
+
                   <div className="grid">
                     {filtreradeProdukter.length === 0 ? <div className="empty">Inga produkter matchar sökningen.</div> : null}
 
@@ -1615,7 +1732,14 @@ const mottaLeverans = (rowKey, qtyInput) => {
 
                           <div className="qtyPick" onClick={(e) => e.stopPropagation()}>
                             <div className="qtyPick__label">Antal (st)</div>
-                            <input className="qtyInput" type="number" min={1} inputMode="numeric" value={qty} onChange={(e) => setQty(p.id, e.target.value)} />
+                            <input
+                              className="qtyInput"
+                              type="number"
+                              min={1}
+                              inputMode="numeric"
+                              value={qty}
+                              onChange={(e) => setQty(p.id, e.target.value)}
+                            />
                             <div className="qtyChips">
                               <button className="chip" type="button" onClick={() => setQty(p.id, 1)}>
                                 1
@@ -2074,7 +2198,9 @@ const mottaLeverans = (rowKey, qtyInput) => {
                         <div className="summaryCard">
                           <div className="summaryTitle">Inleverans – beställda artiklar</div>
                           <div className="summaryValue">{totalKvar} st kvar att ta emot</div>
-                          <div className="summarySub">{ejKompletta.length} rader ej kompletta • {kompletta.length} levererade</div>
+                          <div className="summarySub">
+                            {ejKompletta.length} rader ej kompletta • {kompletta.length} levererade
+                          </div>
                         </div>
 
                         <section className="card">
@@ -2100,7 +2226,9 @@ const mottaLeverans = (rowKey, qtyInput) => {
                               </datalist>
                             </label>
                           </div>
-                          <div className="muted" style={{ marginTop: 8 }}>Du kan göra delleveranser. Varje mottagning ökar huvudlagret direkt.</div>
+                          <div className="muted" style={{ marginTop: 8 }}>
+                            Du kan göra delleveranser. Varje mottagning ökar huvudlagret direkt.
+                          </div>
                         </section>
 
                         <div className="grid" style={{ marginTop: 12 }}>
@@ -2139,7 +2267,9 @@ const mottaLeverans = (rowKey, qtyInput) => {
                                   {r.bestalldTid ? (
                                     <div className="meta__row">
                                       <span className="meta__label">Beställd</span>
-                                      <span className="meta__value">{r.bestalldTid} • {r.bestalldAv || "—"}</span>
+                                      <span className="meta__value">
+                                        {r.bestalldTid} • {r.bestalldAv || "—"}
+                                      </span>
                                     </div>
                                   ) : null}
                                 </div>
@@ -2148,10 +2278,18 @@ const mottaLeverans = (rowKey, qtyInput) => {
                                   <div className="qtyPick__label">Ta emot nu</div>
                                   <input className="qtyInput" type="number" min={1} max={Math.max(1, kvar)} inputMode="numeric" value={qtyNow} onChange={(e) => setLevQty(r.key, e.target.value)} />
                                   <div className="qtyChips">
-                                    <button className="chip" type="button" onClick={() => setLevQty(r.key, 1)}>1</button>
-                                    <button className="chip" type="button" onClick={() => setLevQty(r.key, Math.min(5, Math.max(1, kvar)))}>5</button>
-                                    <button className="chip" type="button" onClick={() => setLevQty(r.key, Math.min(10, Math.max(1, kvar)))}>10</button>
-                                    <button className="chip" type="button" onClick={() => setLevQty(r.key, Math.max(1, kvar))} title="Sätt till kvar">⇢</button>
+                                    <button className="chip" type="button" onClick={() => setLevQty(r.key, 1)}>
+                                      1
+                                    </button>
+                                    <button className="chip" type="button" onClick={() => setLevQty(r.key, Math.min(5, Math.max(1, kvar)))}>
+                                      5
+                                    </button>
+                                    <button className="chip" type="button" onClick={() => setLevQty(r.key, Math.min(10, Math.max(1, kvar)))}>
+                                      10
+                                    </button>
+                                    <button className="chip" type="button" onClick={() => setLevQty(r.key, Math.max(1, kvar))} title="Sätt till kvar">
+                                      ⇢
+                                    </button>
                                   </div>
                                 </div>
 
@@ -2205,7 +2343,9 @@ const mottaLeverans = (rowKey, qtyInput) => {
                                     </div>
                                     <div className="meta__row">
                                       <span className="meta__label">Klarmarkerad</span>
-                                      <span className="meta__value">{r.levereradTid || "—"} • {r.levereradAv || "—"}</span>
+                                      <span className="meta__value">
+                                        {r.levereradTid || "—"} • {r.levereradAv || "—"}
+                                      </span>
                                     </div>
                                   </div>
                                 </section>
@@ -2473,7 +2613,9 @@ const mottaLeverans = (rowKey, qtyInput) => {
                       <span>Använd antal per produkt</span>
                     </label>
 
-                    {!batchUsePerItemQty ? <input className="qtyInput" type="number" min={1} inputMode="numeric" value={batchQty} onChange={(e) => setBatchQty(e.target.value)} /> : null}
+                    {!batchUsePerItemQty ? (
+                      <input className="qtyInput" type="number" min={1} inputMode="numeric" value={batchQty} onChange={(e) => setBatchQty(e.target.value)} />
+                    ) : null}
                   </div>
                 </label>
 
@@ -2525,6 +2667,64 @@ const mottaLeverans = (rowKey, qtyInput) => {
                   </label>
                 </div>
               )}
+            </Modal>
+
+            {/* ===== ✅ Modal: Ny produkt ===== */}
+            <Modal
+              open={addProdOpen}
+              title="➕ Ny produkt i huvudlager"
+              onClose={closeAddProd}
+              footer={
+                <>
+                  <PrimaryButton tone="ghost" onClick={closeAddProd}>
+                    Avbryt
+                  </PrimaryButton>
+                  <PrimaryButton tone="primary" onClick={sparaNyProdukt} disabled={!canEditHuvudlager}>
+                    Spara
+                  </PrimaryButton>
+                </>
+              }
+            >
+              <div className="formGrid">
+                <label className="field">
+                  <span>Produkt *</span>
+                  <input value={newProd.produkt} onChange={(e) => setNewProd((p) => ({ ...p, produkt: e.target.value }))} placeholder="t.ex. Fotboll strl 5" />
+                </label>
+
+                <label className="field">
+                  <span>Huvudgrupp</span>
+                  <input value={newProd.huvudgrupp} onChange={(e) => setNewProd((p) => ({ ...p, huvudgrupp: e.target.value }))} placeholder="t.ex. Bollar, Västar…" />
+                </label>
+
+                <label className="field">
+                  <span>Lagerplats</span>
+                  <input value={newProd.lagerplats} onChange={(e) => setNewProd((p) => ({ ...p, lagerplats: e.target.value }))} list="lagerplats-list" placeholder="Huvudförråd" />
+                  <datalist id="lagerplats-list">
+                    {lagerplatsOptions.map((lp) => (
+                      <option key={lp} value={lp} />
+                    ))}
+                  </datalist>
+                </label>
+
+                <label className="field">
+                  <span>Antal (startlager)</span>
+                  <input type="number" min={0} inputMode="numeric" value={newProd.antal} onChange={(e) => setNewProd((p) => ({ ...p, antal: e.target.value }))} />
+                </label>
+
+                <label className="field">
+                  <span>Min antal</span>
+                  <input type="number" min={0} inputMode="numeric" value={newProd.minAntal} onChange={(e) => setNewProd((p) => ({ ...p, minAntal: e.target.value }))} />
+                </label>
+
+                <label className="field">
+                  <span>Beställningspunkt</span>
+                  <input type="number" min={0} inputMode="numeric" value={newProd.beställningspunkt} onChange={(e) => setNewProd((p) => ({ ...p, beställningspunkt: e.target.value }))} />
+                </label>
+
+                <div className="muted" style={{ marginTop: 6 }}>
+                  Tips: Om “Min antal” eller “Beställningspunkt” är 0 så påverkar den inte status/inköp.
+                </div>
+              </div>
             </Modal>
           </>
         )}
