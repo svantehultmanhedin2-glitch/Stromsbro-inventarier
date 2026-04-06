@@ -2235,7 +2235,18 @@ if (!cloudSaveDebounceRef.current) {
                       </label>
                       <label className="field">
                         <span>Antal</span>
-                        <input type="number" min={1} inputMode="numeric" value={nyttOnskemal.antal} onChange={(e) => setNyttOnskemal((o) => ({ ...o, antal: Math.max(1, toInt(e.target.value, 1)) }))} />
+
+<QtyInput
+  value={nyttOnskemal.antal}
+  min={1}
+  onChange={(n) =>
+    setNyttOnskemal((o) => ({
+      ...o,
+      antal: n,
+    }))
+  }
+/>
+
                       </label>
                       <label className="field">
                         <span>Kommentar</span>
