@@ -1,5 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as XLSX from "xlsx";
+import QtyInput from "./components/common/QtyInput";
+
 
 /* ================= ErrorBoundary ================= */
 class ErrorBoundary extends React.Component {
@@ -64,9 +66,18 @@ function saveState(state) {
 }
 
 
-/* ================= Cloud API URLs ================= */
+/* ================= Cloud sync (Vercel KV via API) ================= */
 const CLOUD_GET_URL = "/api/state/get";
 const CLOUD_SET_URL = "/api/state/set";
+
+function createDebouncer(ms = 900) {
+  let t = null;
+  return (fn) => {
+    if (t) clearTimeout(t);
+    t = setTimeout(fn, ms);
+  };
+}
+
 
 /* ================= Utils ================= */
 function normalizeHeader(h) {
@@ -338,28 +349,13 @@ function LoginScreen({ users, onLogin }) {
   );
 }
 
-/* ================= Cloud helpers ================= */
-function createDebouncer(ms = 900) {
-  let t = null;
-  return (fn) => {
-    if (t) clearTimeout(t);
-    t = setTimeout(fn, ms);
-  };
-}
+
 
 /* ================= App ================= */
 export default function App() {
   const saved = loadState();
 
-// ===== Cloud sync (STEG 5) =====
-const cloudHydratedRef = useRef(false);
-const cloudSaveDebounceRef = useRef(createDebouncer(900));
-const [cloudStatus, setCloudStatus] = useState({
-  loading: false,
-  lastSync: "",
-});
-
-  /* ===== Auth/User state ===== */
+/* ===== Auth/User state ===== */
   const [users, setUsers] = useState(() => {
     const base =
       Array.isArray(saved?.users) && saved.users.length
@@ -386,26 +382,7 @@ const [cloudStatus, setCloudStatus] = useState({
     }
   }, [currentUser]);
 
-  /* ===== Behörigheter ===== */
-  const isAdmin = currentUser?.role === "Admin";
-  const isMA = currentUser?.role === "Materialansvarig";
-  const isLedare = currentUser?.role === "Ledare";
-
-  const canEditUsers = isAdmin;
-  const canSeeInkop = isAdmin || isMA;
-  const canSeeInleverans = isAdmin || isMA;
-  const canMoveToInkop = isAdmin || isMA;
-  const canUtlamna = isAdmin || isMA;
-  const canEditHuvudlager = isAdmin || isMA;
-  const canImportExport = isAdmin || isMA;
-
-  /* ===== App state ===== */
-  const { info, show: showInfo } = useToast(2500);
-  const [fel, setFel] = useState("");
-  const [vy, setVy] = useState(saved?.vy ?? "lager");
-  const [sok, setSok] = useState("");
-
-  const [produkter, setProdukter] = useState(
+const [produkter, setProdukter] = useState(
     Array.isArray(saved?.produkter)
       ? saved.produkter
       : [
@@ -450,11 +427,142 @@ const [cloudStatus, setCloudStatus] = useState({
     setRecentComments((prev) => [s, ...prev.filter((x) => x !== s)].slice(0, 8));
   };
 
+// ===== Cloud sync refs (konfliktsäkert + ingen loop) =====
+  const cloudHydratedRef = useRef(false);        // true efter första lyckade (eller misslyckade) load-försök
+  const cloudVersionRef = useRef(0);             // senaste serverversion vi känner till
+  const suppressCloudSaveRef = useRef(false);    // true när vi applicerar cloud-data
+ 
+const cloudSaveDebounceRef = useRef(null);
+if (!cloudSaveDebounceRef.current) {
+  cloudSaveDebounceRef.current = createDebouncer(900);
+}
+
+  const cloudInFlightRef = useRef(false);        // förhindrar parallella reloads
+
+  const [cloudStatus, setCloudStatus] = useState({ loading: false, lastSync: "" });
+
+  // ===== Hjälpare: applicera ENDAST delad state från cloud =====
+  const applyCloudPayload = useCallback((p) => {
+    suppressCloudSaveRef.current = true;
+
+    // version först
+    cloudVersionRef.current = p?.__version ?? 0;
+
+    // ✅ DELAD DATA (synkas mellan enheter)
+    if (Array.isArray(p?.users)) setUsers(p.users);                // OBS: om du vill undvika PIN i molnet, säg till så justerar vi
+    if (Array.isArray(p?.produkter)) setProdukter(p.produkter);
+    if (Array.isArray(p?.inkopslista)) setInkopslista(p.inkopslista);
+    if (Array.isArray(p?.onskemal)) setOnskemal(p.onskemal);
+    if (Array.isArray(p?.historik)) setHistorik(p.historik);
+    if (Array.isArray(p?.lagLager)) setLagLager(p.lagLager);
+
+    // ❌ LOKAL DATA (synkas INTE — per enhet enligt A)
+    // - currentUser
+    // - vy, sok, aktivtLag
+    // - qtyMap, recentComments
+    // - leveransKommentar, leveransLagerplats, leveransQtyMap
+    // - övriga UI state
+
+    cloudHydratedRef.current = true;
+
+    // släpp spärren efter att state satts
+    queueMicrotask(() => {
+      suppressCloudSaveRef.current = false;
+    });
+  }, [setUsers, setProdukter, setInkopslista, setOnskemal, setHistorik, setLagLager]);
+
+  // ===== Hämta från cloud (skippa apply om version ej ändrats) =====
+  const reloadFromCloud = useCallback(async ({ force = false } = {}) => {
+    if (cloudInFlightRef.current) return;
+    cloudInFlightRef.current = true;
+
+    try {
+      const res = await fetch(`${CLOUD_GET_URL}?t=${Date.now()}`, { cache: "no-store" });
+      if (!res.ok) {
+        cloudHydratedRef.current = true;
+        return;
+      }
+
+      const data = await res.json().catch(() => null);
+      const p = data?.payload;
+
+      if (!data?.ok || !p) {
+        cloudHydratedRef.current = true;
+        return;
+      }
+
+      const nextVer = p.__version ?? 0;
+      const sameVersion = cloudHydratedRef.current && nextVer === cloudVersionRef.current;
+
+      if (!force && sameVersion) {
+        setCloudStatus((s) => ({ ...s, lastSync: data.updatedAt || p.__meta?.updatedAt || s.lastSync }));
+        return;
+      }
+
+      applyCloudPayload(p);
+      setCloudStatus((s) => ({
+        ...s,
+        lastSync: data.updatedAt || p.__meta?.updatedAt || new Date().toISOString(),
+      }));
+    } catch (e) {
+      cloudHydratedRef.current = true;
+      console.warn("Cloud reload failed:", e);
+    } finally {
+      cloudInFlightRef.current = false;
+    }
+  }, [applyCloudPayload]);
+
+  // ===== Initial load + polling =====
+  useEffect(() => {
+    let cancelled = false;
+
+    (async () => {
+      setCloudStatus((s) => ({ ...s, loading: true }));
+      await reloadFromCloud({ force: true });
+      if (!cancelled) setCloudStatus((s) => ({ ...s, loading: false }));
+    })();
+
+    const id = setInterval(() => {
+      reloadFromCloud(); // silent polling
+    }, 5000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [reloadFromCloud]);
+
+  
+
+  /* ===== Behörigheter ===== */
+  const isAdmin = currentUser?.role === "Admin";
+  const isMA = currentUser?.role === "Materialansvarig";
+  const isLedare = currentUser?.role === "Ledare";
+
+  const canEditUsers = isAdmin;
+  const canSeeInkop = isAdmin || isMA;
+  const canSeeInleverans = isAdmin || isMA;
+  const canMoveToInkop = isAdmin || isMA;
+  const canUtlamna = isAdmin || isMA;
+  const canEditHuvudlager = isAdmin || isMA;
+  const canImportExport = isAdmin || isMA;
+
+  /* ===== App state ===== */
+  const { info, show: showInfo } = useToast(2500);
+  const [fel, setFel] = useState("");
+  const [vy, setVy] = useState(saved?.vy ?? "lager");
+  const [sok, setSok] = useState("");
+
+  
+
   /* ===== Qty per product ===== */
   const [qtyMap, setQtyMap] = useState(() =>
     saved?.qtyMap && typeof saved.qtyMap === "object" ? saved.qtyMap : {}
   );
-  const getQty = (id) => Math.max(1, toInt(qtyMap[id], 1));
+  const getQty = (id) => {
+  const v = qtyMap[id];
+  return v === 0 ? 0 : Math.max(1, toInt(v, 1));
+};
   const setQty = (id, value) => {
     const n = Math.max(1, toInt(value, 1));
     setQtyMap((prev) => ({ ...prev, [id]: n }));
@@ -599,60 +707,74 @@ const [cloudStatus, setCloudStatus] = useState({
 
     closeAddProd();
   };
-/* ===== ✅ STEG 5.1: Hämta state från Vercel KV ===== */
-useEffect(() => {
-  let cancelled = false;
 
-  (async () => {
-    try {
-      setCloudStatus((s) => ({ ...s, loading: true }));
 
-      const res = await fetch(CLOUD_GET_URL);
-      const data = await res.json();
+/* ===== Persist state (local ALWAYS + cloud for shared data) ===== */
+  useEffect(() => {
+    // 1) ALLT lokalt (offline + per-enhet inställningar + currentUser)
+    const localPayload = {
+      vy,
+      users,
+      currentUser,              // ✅ per enhet (val A)
+      produkter,
+      inkopslista,
+      onskemal,
+      historik,
+      lagLager,
+      aktivtLag,
+      recentComments,
+      qtyMap,
+      leveransKommentar,
+      leveransLagerplats,
+      leveransQtyMap,
+    };
+    saveState(localPayload);
 
-      if (cancelled) return;
+    // 2) Cloud: vänta tills vi hydraterat (annars overwrite-risk)
+    if (!cloudHydratedRef.current) return;
 
-      if (data?.ok && data?.payload) {
-        const p = data.payload;
+    // 3) Om vi just applicerade cloud-data, skriv inte tillbaka (undvik loop)
+    if (suppressCloudSaveRef.current) return;
 
-        if (Array.isArray(p.users)) setUsers(p.users);
-        if (p.currentUser) setCurrentUser(p.currentUser);
+    // 4) Bara delad data till cloud (currentUser INTE med)
+    const cloudPayload = {
+      __version: cloudVersionRef.current,
+      users,
+      produkter,
+      inkopslista,
+      onskemal,
+      historik,
+      lagLager,
+      __meta: { updatedAt: new Date().toISOString() },
+    };
 
-        if (typeof p.vy === "string") setVy(p.vy);
-        if (Array.isArray(p.produkter)) setProdukter(p.produkter);
-        if (Array.isArray(p.inkopslista)) setInkopslista(p.inkopslista);
-        if (Array.isArray(p.onskemal)) setOnskemal(p.onskemal);
-        if (Array.isArray(p.historik)) setHistorik(p.historik);
-        if (Array.isArray(p.lagLager)) setLagLager(p.lagLager);
-
-        if (typeof p.aktivtLag === "string") setAktivtLag(p.aktivtLag);
-        if (Array.isArray(p.recentComments)) setRecentComments(p.recentComments);
-        if (p.qtyMap) setQtyMap(p.qtyMap);
-
-        cloudHydratedRef.current = true;
-        setCloudStatus({
-          loading: false,
-          lastSync: p.__meta?.updatedAt || new Date().toISOString(),
+    cloudSaveDebounceRef.current(async () => {
+      try {
+        const res = await fetch(CLOUD_SET_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          cache: "no-store",
+          body: JSON.stringify({ payload: cloudPayload }),
         });
-      } else {
-        cloudHydratedRef.current = true;
-        setCloudStatus((s) => ({ ...s, loading: false }));
+
+        // Konflikt: någon annan har sparat nyare -> ladda om senaste och applicera
+        if (res.status === 409) {
+          await reloadFromCloud({ force: true });
+          return;
+        }
+
+        if (res.ok) {
+          const json = await res.json().catch(() => null);
+          if (json?.version !== undefined) {
+            cloudVersionRef.current = json.version;
+          }
+          setCloudStatus((s) => ({ ...s, lastSync: new Date().toISOString() }));
+        }
+      } catch (e) {
+        console.warn("Cloud save failed:", e);
       }
-    } catch (e) {
-      cloudHydratedRef.current = true;
-      setCloudStatus((s) => ({ ...s, loading: false }));
-      console.warn("Cloud load failed:", e);
-    }
-  })();
-
-  return () => {
-    cancelled = true;
-  };
-}, []);
-
-/* ===== Persist ALL state (local + cloud) ===== */
-useEffect(() => {
-  const payload = {
+    });
+  }, [
     vy,
     users,
     currentUser,
@@ -667,42 +789,8 @@ useEffect(() => {
     leveransKommentar,
     leveransLagerplats,
     leveransQtyMap,
-  };
-
-  // Local fallback
-  saveState(payload);
-
-  // Cloud sync
-  if (!cloudHydratedRef.current) return;
-
-  cloudSaveDebounceRef.current(async () => {
-    try {
-      await fetch(CLOUD_SET_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ payload }),
-      });
-      setCloudStatus((s) => ({ ...s, lastSync: new Date().toISOString() }));
-    } catch (e) {
-      console.warn("Cloud save failed:", e);
-    }
-  });
-}, [
-  vy,
-  users,
-  currentUser,
-  produkter,
-  inkopslista,
-  onskemal,
-  historik,
-  lagLager,
-  aktivtLag,
-  recentComments,
-  qtyMap,
-  leveransKommentar,
-  leveransLagerplats,
-  leveransQtyMap,
-]);
+    reloadFromCloud,
+  ]);
 
   /* ===== View guarding ===== */
   useEffect(() => {
@@ -1823,14 +1911,13 @@ useEffect(() => {
 
                           <div className="qtyPick" onClick={(e) => e.stopPropagation()}>
                             <div className="qtyPick__label">Antal (st)</div>
-                            <input
-                              className="qtyInput"
-                              type="number"
-                              min={1}
-                              inputMode="numeric"
-                              value={qty}
-                              onChange={(e) => setQty(p.id, e.target.value)}
-                            />
+                            
+<QtyInput
+  value={qty}
+  min={1}
+  onChange={(n) => setQty(p.id, n)}
+/>
+
                             <div className="qtyChips">
                               <button className="chip" type="button" onClick={() => setQty(p.id, 1)}>
                                 1
@@ -1932,7 +2019,11 @@ useEffect(() => {
 
                           <div className="qtyPick" style={{ marginTop: 10 }}>
                             <div className="qtyPick__label">Ändra antal</div>
-                            <input className="qtyInput" type="number" min={0} inputMode="numeric" value={toInt(r.antal, 0)} onChange={(e) => uppdateraLagRadAntal(r.id, e.target.value)} />
+                            <QtyInput
+  value={toInt(r.antal, 0)}
+  min={0}
+  onChange={(n) => uppdateraLagRadAntal(r.id, n)}
+/>
                           </div>
 
                           <div className="btnRow" style={{ marginTop: 10 }}>
@@ -2001,7 +2092,11 @@ useEffect(() => {
 
                         <label className="field">
                           <span>Antal</span>
-                          <input type="number" min={1} inputMode="numeric" value={flytt.antal} onChange={(e) => setFlytt((f) => ({ ...f, antal: Math.max(1, toInt(e.target.value, 1)) }))} />
+<QtyInput
+  value={flytt.antal}
+  min={1}
+  onChange={(n) => setFlytt((f) => ({ ...f, antal: n }))}
+/>
                         </label>
 
                         <label className="field">
@@ -2367,7 +2462,11 @@ useEffect(() => {
 
                                 <div className="qtyPick">
                                   <div className="qtyPick__label">Ta emot nu</div>
-                                  <input className="qtyInput" type="number" min={1} max={Math.max(1, kvar)} inputMode="numeric" value={qtyNow} onChange={(e) => setLevQty(r.key, e.target.value)} />
+<QtyInput
+  value={qtyNow}
+  min={1}
+  onChange={(n) => setLevQty(r.key, n)}
+/>
                                   <div className="qtyChips">
                                     <button className="chip" type="button" onClick={() => setLevQty(r.key, 1)}>
                                       1
@@ -2705,7 +2804,11 @@ useEffect(() => {
                     </label>
 
                     {!batchUsePerItemQty ? (
-                      <input className="qtyInput" type="number" min={1} inputMode="numeric" value={batchQty} onChange={(e) => setBatchQty(e.target.value)} />
+<QtyInput
+  value={batchQty}
+  min={1}
+  onChange={setBatchQty}
+/>
                     ) : null}
                   </div>
                 </label>
@@ -2754,7 +2857,11 @@ useEffect(() => {
 
                   <label className="field">
                     <span>Antal att returnera</span>
-                    <input type="number" min={1} max={Math.max(1, toInt(returRad.antal, 1))} inputMode="numeric" value={returQty} onChange={(e) => setReturQty(e.target.value)} />
+<QtyInput
+  value={returQty}
+  min={1}
+  onChange={setReturQty}
+/>
                   </label>
                 </div>
               )}
@@ -2799,17 +2906,30 @@ useEffect(() => {
 
                 <label className="field">
                   <span>Antal (startlager)</span>
-                  <input type="number" min={0} inputMode="numeric" value={newProd.antal} onChange={(e) => setNewProd((p) => ({ ...p, antal: e.target.value }))} />
+<QtyInput
+  value={newProd.antal}
+  min={0}
+  onChange={(n) => setNewProd((p) => ({ ...p, antal: n }))}
+/>
+
                 </label>
 
                 <label className="field">
                   <span>Min antal</span>
-                  <input type="number" min={0} inputMode="numeric" value={newProd.minAntal} onChange={(e) => setNewProd((p) => ({ ...p, minAntal: e.target.value }))} />
+<QtyInput
+  value={newProd.minAntal}
+  min={0}
+  onChange={(n) => setNewProd((p) => ({ ...p, minAntal: n }))}
+/>
                 </label>
 
                 <label className="field">
                   <span>Beställningspunkt</span>
-                  <input type="number" min={0} inputMode="numeric" value={newProd.beställningspunkt} onChange={(e) => setNewProd((p) => ({ ...p, beställningspunkt: e.target.value }))} />
+<QtyInput
+  value={newProd.beställningspunkt}
+  min={0}
+  onChange={(n) => setNewProd((p) => ({ ...p, beställningspunkt: n }))}
+/>
                 </label>
 
                 <div className="muted" style={{ marginTop: 6 }}>
