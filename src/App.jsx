@@ -333,6 +333,15 @@ function LoginScreen({ users, onLogin }) {
   );
 }
 
+/* ================= Cloud helpers ================= */
+function createDebouncer(ms = 900) {
+  let t = null;
+  return (fn) => {
+    if (t) clearTimeout(t);
+    t = setTimeout(fn, ms);
+  };
+}
+
 /* ================= App ================= */
 export default function App() {
   const saved = loadState();
