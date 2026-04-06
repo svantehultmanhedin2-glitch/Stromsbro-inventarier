@@ -363,7 +363,7 @@ export default function App() {
         : [
             { id: 1, name: "Admin", username: "admin", role: "Admin", lag: null },
             { id: 2, name: "Materialansvarig", username: "ma", role: "Materialansvarig", lag: null },
-            { id: 3, name: "Ledare P12", username: "p12", role: "Ledare", lag: "P12" },
+            { id: 3, name: "Ledare P-2012", username: "p12", role: "Ledare", lag: "P-2012" },
           ];
 
     return base.map((u) => {
@@ -416,7 +416,7 @@ const [produkter, setProdukter] = useState(
   const [historik, setHistorik] = useState(Array.isArray(saved?.historik) ? saved.historik : []);
 
   const [lagLager, setLagLager] = useState(Array.isArray(saved?.lagLager) ? saved.lagLager : []);
-  const [aktivtLag, setAktivtLag] = useState(saved?.aktivtLag ?? "P12");
+  const [aktivtLag, setAktivtLag] = useState(saved?.aktivtLag ?? "P-2012");
 
   const [recentComments, setRecentComments] = useState(
     Array.isArray(saved?.recentComments) ? saved.recentComments : []
@@ -593,7 +593,7 @@ if (!cloudSaveDebounceRef.current) {
   const [nyttOnskemal, setNyttOnskemal] = useState({ huvudgrupp: "", produkt: "", antal: 1, kommentar: "" });
 
   const [flytt, setFlytt] = useState({
-    lag: saved?.aktivtLag ?? "P12",
+    lag: saved?.aktivtLag ?? "P-2012",
     produktId: "",
     antal: 1,
     utlamningsdatum: "",
@@ -601,7 +601,7 @@ if (!cloudSaveDebounceRef.current) {
   });
 
   const [nyLagRad, setNyLagRad] = useState({
-    lag: saved?.aktivtLag ?? "P12",
+    lag: saved?.aktivtLag ?? "P-2012",
     huvudgrupp: "",
     produkt: "",
     antal: 1,
@@ -833,7 +833,7 @@ if (!cloudSaveDebounceRef.current) {
   }, [filtreradInkop]);
 
   const lagLista = useMemo(() => {
-    const set = new Set(["P12", "F13", "A-lag", "U-lag"]);
+    const set = new Set(["P-2019", "F-2019", "P-2018", "F-2018", "P-2017", "F-2017", "P-2016", "P-2015", "P-2014", "F-2014", "P-2013", "F-2013", "P-2012", "F-2011/12", "P-2011", "P-2010", "A-lag Damer", "Herr"]);
     (lagLager ?? []).forEach((r) => set.add(r.lag || "Okänt"));
     return Array.from(set).filter(Boolean).sort();
   }, [lagLager]);
@@ -1419,7 +1419,7 @@ if (!cloudSaveDebounceRef.current) {
   };
 
   /* ================= Admin: användare + PIN ================= */
-  const [userDraft, setUserDraft] = useState({ name: "", username: "", role: "Ledare", lag: "P12", pin: "" });
+  const [userDraft, setUserDraft] = useState({ name: "", username: "", role: "Ledare", lag: "P-2012", pin: "" });
 
   const addUser = () => {
     if (!canEditUsers) return;
@@ -1446,7 +1446,7 @@ if (!cloudSaveDebounceRef.current) {
     };
 
     setUsers((prev) => [u, ...prev]);
-    setUserDraft({ name: "", username: "", role: "Ledare", lag: "P12", pin: "" });
+    setUserDraft({ name: "", username: "", role: "Ledare", lag: "P-2012", pin: "" });
     showInfo("Användare skapad.");
   };
 
@@ -2770,7 +2770,7 @@ if (!cloudSaveDebounceRef.current) {
 
                     <label className="field">
                       <span>Kommentar</span>
-                      <input value={txComment} onChange={(e) => setTxComment(e.target.value)} placeholder="t.ex. P12 träning" list="recent-comments" />
+                      <input value={txComment} onChange={(e) => setTxComment(e.target.value)} placeholder="t.ex. P-2012 träning" list="recent-comments" />
                       <datalist id="recent-comments">
                         {recentComments.map((c) => (
                           <option key={c} value={c} />
@@ -2826,7 +2826,7 @@ if (!cloudSaveDebounceRef.current) {
 
                 <label className="field">
                   <span>Kommentar (gemensam)</span>
-                  <input value={batchComment} onChange={(e) => setBatchComment(e.target.value)} placeholder="t.ex. P12 träning" list="recent-comments" />
+                  <input value={batchComment} onChange={(e) => setBatchComment(e.target.value)} placeholder="t.ex. P-2012 träning" list="recent-comments" />
                 </label>
               </div>
             </Modal>
