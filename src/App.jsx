@@ -432,6 +432,9 @@ const [produkter, setProdukter] = useState(
   const cloudVersionRef = useRef(0);             // senaste serverversion vi känner till
   const suppressCloudSaveRef = useRef(false);    // true när vi applicerar cloud-data
  
+const cloudAttemptedRef = useRef(false);
+const cloudLoadedOkRef = useRef(false);
+
 const cloudSaveDebounceRef = useRef(null);
 if (!cloudSaveDebounceRef.current) {
   cloudSaveDebounceRef.current = createDebouncer(900);
@@ -463,7 +466,10 @@ if (!cloudSaveDebounceRef.current) {
     // - leveransKommentar, leveransLagerplats, leveransQtyMap
     // - övriga UI state
 
-    cloudHydratedRef.current = true;
+    
+  cloudLoadedOkRef.current = true;     // ✅ viktig
+  cloudAttemptedRef.current = true;    // ✅
+
 
     // släpp spärren efter att state satts
     queueMicrotask(() => {
@@ -472,45 +478,37 @@ if (!cloudSaveDebounceRef.current) {
   }, [setUsers, setProdukter, setInkopslista, setOnskemal, setHistorik, setLagLager]);
 
   // ===== Hämta från cloud (skippa apply om version ej ändrats) =====
-  const reloadFromCloud = useCallback(async ({ force = false } = {}) => {
-    if (cloudInFlightRef.current) return;
-    cloudInFlightRef.current = true;
+const reloadFromCloud = useCallback(async ({ force = false } = {}) => {
+  if (cloudInFlightRef.current) return;
+  cloudInFlightRef.current = true;
 
-    try {
-      const res = await fetch(`${CLOUD_GET_URL}?t=${Date.now()}`, { cache: "no-store" });
-      if (!res.ok) {
-        cloudHydratedRef.current = true;
-        return;
-      }
+  try {
+    const res = await fetch(`${CLOUD_GET_URL}?t=${Date.now()}`, { cache: "no-store" });
+    cloudAttemptedRef.current = true;
 
-      const data = await res.json().catch(() => null);
-      const p = data?.payload;
+    if (!res.ok) return;
 
-      if (!data?.ok || !p) {
-        cloudHydratedRef.current = true;
-        return;
-      }
+    const data = await res.json().catch(() => null);
+    const p = data?.payload;
+    if (!data?.ok || !p) return;
 
-      const nextVer = p.__version ?? 0;
-      const sameVersion = cloudHydratedRef.current && nextVer === cloudVersionRef.current;
+    const nextVer = p.__version ?? 0;
+    const sameVersion = cloudLoadedOkRef.current && nextVer === cloudVersionRef.current;
 
-      if (!force && sameVersion) {
-        setCloudStatus((s) => ({ ...s, lastSync: data.updatedAt || p.__meta?.updatedAt || s.lastSync }));
-        return;
-      }
-
-      applyCloudPayload(p);
-      setCloudStatus((s) => ({
-        ...s,
-        lastSync: data.updatedAt || p.__meta?.updatedAt || new Date().toISOString(),
-      }));
-    } catch (e) {
-      cloudHydratedRef.current = true;
-      console.warn("Cloud reload failed:", e);
-    } finally {
-      cloudInFlightRef.current = false;
+    if (!force && sameVersion) {
+      setCloudStatus((s) => ({ ...s, lastSync: data.updatedAt || p.__meta?.updatedAt || s.lastSync }));
+      return;
     }
-  }, [applyCloudPayload]);
+
+    applyCloudPayload(p);
+    setCloudStatus((s) => ({ ...s, lastSync: data.updatedAt || p.__meta?.updatedAt || new Date().toISOString() }));
+  } catch (e) {
+    cloudAttemptedRef.current = true;
+    console.warn("Cloud reload failed:", e);
+  } finally {
+    cloudInFlightRef.current = false;
+  }
+}, [applyCloudPayload]);
 
   // ===== Initial load + polling =====
   useEffect(() => {
@@ -731,7 +729,7 @@ if (!cloudSaveDebounceRef.current) {
     saveState(localPayload);
 
     // 2) Cloud: vänta tills vi hydraterat (annars overwrite-risk)
-    if (!cloudHydratedRef.current) return;
+    if (!cloudLoadedOkRef.current) return;
 
     // 3) Om vi just applicerade cloud-data, skriv inte tillbaka (undvik loop)
     if (suppressCloudSaveRef.current) return;
