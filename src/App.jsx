@@ -250,55 +250,48 @@ function buildInkopLista(produkter, prevList = []) {
   const prevByKey = new Map((prevList ?? []).map((x) => [x.key, x]));
 
 const auto = (produkter ?? [])
-.filter((p) => !p.autoInkopPaused) // ⏸️ respektera paus  
-.filter((p) => Number.isFinite(p.antal) && Number.isFinite(p.beställningspunkt))
+  .filter((p) => !p.autoInkopPaused)
   .filter((p) => toInt(p.beställningspunkt, 0) > 0)
-  .filter((p) => toInt(p.antal, 0) <= toInt(p.beställningspunkt, 0))
+  .filter((p) => {
+    const bp = toInt(p.beställningspunkt, 0);
+    const antal = toInt(p.antal, 0);
+    const orderThreshold = Math.floor(bp * 0.7);
+    return antal <= orderThreshold; // ✅ ENDAST “Beställ”
+  })
   .map((p) => {
-    const target =
-      toInt(p.minAntal, 0) > 0
-        ? toInt(p.minAntal, 0)
-        : toInt(p.beställningspunkt, 0);
+    const bp = toInt(p.beställningspunkt, 0);
+    const antal = toInt(p.antal, 0);
+    const rekommenderat = Math.max(0, bp - antal);
 
-    const rekommenderat = Math.max(0, target - toInt(p.antal, 0));
+    if (rekommenderat <= 0) return null;
+
     const key = makeKey(p.huvudgrupp, p.produkt);
-
     const prev = prevByKey.get(key);
     const manuell = prev?.manuell === true;
 
-    // ✅ NYTT: om auto och 0 → SKAPA INTE RAD
-    if (!manuell && rekommenderat <= 0) return null;
-
-    const antal = manuell
+    const inkopAntal = manuell
       ? Math.max(0, toInt(prev?.antal, 0))
       : rekommenderat;
 
-    // ✅ NYTT: om antal fortfarande 0 → SKAPA INTE RAD
-    if (antal <= 0) return null;
+    if (inkopAntal <= 0) return null;
 
     return {
       id: key,
       key,
       huvudgrupp: p.huvudgrupp ?? "",
       produkt: p.produkt ?? "",
-      antal,
+      antal: inkopAntal,
       rekommenderat,
       manuell,
       bestalld: prev?.bestalld === true,
       bestalldTid: prev?.bestalldTid ?? "",
       bestalldAv: prev?.bestalldAv ?? "",
-      onskemalTid: prev?.onskemalTid ?? "",
-      onskemalAv: prev?.onskemalAv ?? "",
-      onskemalKommentar: prev?.onskemalKommentar ?? "",
-
       mottagetAntal: Math.max(0, toInt(prev?.mottagetAntal, 0)),
       levererad: prev?.levererad === true,
-      levereradTid: prev?.levereradTid ?? "",
-      levereradAv: prev?.levereradAv ?? "",
       leveranser: Array.isArray(prev?.leveranser) ? prev.leveranser : [],
     };
   })
-  .filter(Boolean); // ✅ MYCKET VIKTIG
+  .filter(Boolean);
 
   const bestalldaExtras = (prevList ?? [])
     .filter((x) => x?.bestalld === true)
@@ -508,7 +501,6 @@ const [produkter, setProdukter] = useState(
             produkt: "Fotboll strl 5",
             antal: 12,
             lagerplats: "Huvudförråd",
-            minAntal: 10,
             beställningspunkt: 15,
           },
           {
@@ -517,7 +509,6 @@ const [produkter, setProdukter] = useState(
             produkt: "Träningsvästar gula",
             antal: 6,
             lagerplats: "Lilla förrådet",
-            minAntal: 8,
             beställningspunkt: 10,
           },
         ]
@@ -860,7 +851,6 @@ useEffect(() => {
     produkt: "",
     lagerplats: "Huvudförråd",
     antal: 0,
-    minAntal: 0,
     beställningspunkt: 0,
   });
 
@@ -871,7 +861,6 @@ useEffect(() => {
       produkt: "",
       lagerplats: "Huvudförråd",
       antal: 0,
-      minAntal: 0,
       beställningspunkt: 0,
     });
     setAddProdOpen(true);
@@ -891,7 +880,6 @@ const sparaNyProdukt = () => {
   const lagerplats = String(newProd.lagerplats || "").trim() || "Huvudförråd";
 
   const antalAdd = Math.max(0, toInt(newProd.antal, 0));
-  const minAntal = Math.max(0, toInt(newProd.minAntal, 0));
   const beställningspunkt = Math.max(0, toInt(newProd.beställningspunkt, 0));
 
   const idx = produkter.findIndex(
@@ -914,7 +902,6 @@ const sparaNyProdukt = () => {
       huvudgrupp,
       lagerplats,
       antal: newQty,
-      minAntal,
       beställningspunkt,
     };
 
@@ -928,7 +915,6 @@ const sparaNyProdukt = () => {
       produkt: produktNamn,
       antal: antalAdd,
       lagerplats,
-      minAntal,
       beställningspunkt,
     };
 
@@ -1015,7 +1001,6 @@ const openEditProd = (p) => {
     produkt: p.produkt ?? "",
     lagerplats: p.lagerplats ?? "",
     antal: toInt(p.antal, 0),
-    minAntal: toInt(p.minAntal, 0),
     beställningspunkt: toInt(p.beställningspunkt, 0),
   });
   setEditProdOpen(true);
@@ -1035,7 +1020,6 @@ const sparaRedigeradProdukt = () => {
     huvudgrupp: (editProd.huvudgrupp ?? "").trim(),
     lagerplats: (editProd.lagerplats ?? "").trim() || "Huvudförråd",
     antal: Math.max(0, toInt(editProd.antal, 0)),
-    minAntal: Math.max(0, toInt(editProd.minAntal, 0)),
     beställningspunkt: Math.max(0, toInt(editProd.beställningspunkt, 0)),
   };
 
@@ -1163,15 +1147,24 @@ useEffect(() => {
   }, [vy, currentUser, isLedare, canSeeInkop, canEditUsers, canSeeInleverans]);
 
   /* ===== Derived ===== */
-  const status = (p) => {
-    const antal = toInt(p.antal, 0);
-    const min = toInt(p.minAntal, 0);
-    const bp = toInt(p.beställningspunkt, 0);
-    if (min <= 0 && bp <= 0) return { text: "OK", tone: "ok" };
-    if (min > 0 && antal <= min) return { text: "Beställ", tone: "danger" };
-    if (bp > 0 && antal <= bp) return { text: "Bevaka", tone: "warn" };
-    return { text: "OK", tone: "ok" };
-  };
+ const status = (p) => {
+  const antal = toInt(p.antal, 0);
+  const bp = toInt(p.beställningspunkt, 0);
+
+  if (bp <= 0) return { text: "OK", tone: "ok" };
+
+  const orderThreshold = Math.floor(bp * 0.7); // ✅ justerbar (t.ex. 70 %)
+
+  if (antal <= orderThreshold) {
+    return { text: "Beställ", tone: "danger" };
+  }
+
+  if (antal <= bp) {
+    return { text: "Bevaka", tone: "warn" };
+  }
+
+  return { text: "OK", tone: "ok" };
+};
 
   const filtreradeProdukter = useMemo(() => {
     const q = sok.trim().toLowerCase();
@@ -1574,7 +1567,6 @@ const returTillHuvudlager = (rad, antalInput) => {
       produkt: rad.produkt ?? "",
       antal,
       lagerplats: "Huvudförråd",
-      minAntal: 0,
       beställningspunkt: 0,
     };
     patchedProdId = ny.id;
@@ -1818,7 +1810,6 @@ const mottaLeverans = (rowKey, qtyInput) => {
       produkt: row.produkt ?? "",
       antal: qty,
       lagerplats: leveransLagerplats,
-      minAntal: 0,
       beställningspunkt: 0,
     };
     prodIdTouched = ny.id;
@@ -2064,7 +2055,6 @@ opPatch(OP_ENTITY.users, id, { pinSalt: salt, pinHash: hashPin(newPin, salt) });
             antal: toInt(pick(r, "Antal"), 0),
             lagerplats: String(pick(r, "Lagerplats") ?? "").trim(),
             beställningspunkt: toInt(pick(r, "Beställningspunkt", "Bestallningspunkt"), 0),
-            minAntal: toInt(pick(r, "Min antal", "MinAntal", "Min"), 0),
           };
         })
         .filter(Boolean);
@@ -2180,7 +2170,6 @@ if (navigator.onLine) syncNow();
         Antal: p.antal,
         Lagerplats: p.lagerplats,
         Beställningspunkt: p.beställningspunkt,
-        "Min antal": p.minAntal,
         Status: status(p).text,
       }));
 
@@ -2473,13 +2462,10 @@ if (navigator.onLine) syncNow();
                               <div className="qty__value">{toInt(p.antal, 0)} st</div>
                             </div>
                             <div className="miniMeta">
-                              <div>
-                                Min: <strong>{toInt(p.minAntal, 0)}</strong>
-                              </div>
-                              <div>
-                                Beställ: <strong>{toInt(p.beställningspunkt, 0)}</strong>
-                              </div>
-                            </div>
+  <div>
+    Beställ vid: <strong>{toInt(p.beställningspunkt, 0)}</strong>
+  </div>
+</div>
                           </div>
 
                           <div className="qtyPick" onClick={(e) => e.stopPropagation()}>
@@ -3452,15 +3438,6 @@ footer={
       </label>
 
       <label className="field">
-        <span>Min antal</span>
-        <QtyInput
-          value={editProd.minAntal}
-          min={0}
-          onChange={(n) => setEditProd((p) => ({ ...p, minAntal: n }))}
-        />
-      </label>
-
-      <label className="field">
         <span>Beställningspunkt</span>
         <QtyInput
           value={editProd.beställningspunkt}
@@ -3612,15 +3589,6 @@ footer={
   onChange={(n) => setNewProd((p) => ({ ...p, antal: n }))}
 />
 
-                </label>
-
-                <label className="field">
-                  <span>Min antal</span>
-<QtyInput
-  value={newProd.minAntal}
-  min={0}
-  onChange={(n) => setNewProd((p) => ({ ...p, minAntal: n }))}
-/>
                 </label>
 
                 <label className="field">
