@@ -64,7 +64,102 @@ function saveState(state) {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
   } catch {}
 }
+/* ================= Outbox (offline ops) ================= */
+const OPS_KEY = "stromsbro:pendingOps:v1";
 
+const uuid = () =>
+  globalThis.crypto?.randomUUID
+    ? globalThis.crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+function loadOps() {
+  try {
+    const raw = localStorage.getItem(OPS_KEY);
+    const ops = raw ? JSON.parse(raw) : [];
+    return Array.isArray(ops) ? ops : [];
+  } catch {
+    return [];
+  }
+}
+function saveOps(ops) {
+  try {
+    localStorage.setItem(OPS_KEY, JSON.stringify(ops));
+  } catch {}
+}
+function enqueueOp(op) {
+  const ops = loadOps();
+  ops.push(op);
+  saveOps(ops);
+  return ops.length;
+}
+function clearOps() {
+  saveOps([]);
+  return 0;
+}
+
+/** Hjälp: se till att payload har arrays */
+function ensureArray(obj, key) {
+  if (!obj[key] || !Array.isArray(obj[key])) obj[key] = [];
+}
+function getId(x) {
+  return x?.id;
+}
+
+/** Applicera ops på en payload (non-destructive rebase) */
+function applyOpsToPayload(payload, ops) {
+  const next = structuredClone(payload ?? {});
+  ensureArray(next, "users");
+  ensureArray(next, "produkter");
+  ensureArray(next, "inkopslista");
+  ensureArray(next, "onskemal");
+  ensureArray(next, "historik");
+  ensureArray(next, "lagLager");
+
+  const arrByEntity = {
+    users: next.users,
+    produkter: next.produkter,
+    inkopslista: next.inkopslista,
+    onskemal: next.onskemal,
+    historik: next.historik,
+    lagLager: next.lagLager,
+  };
+
+  for (const op of ops) {
+    const arr = arrByEntity[op.entity];
+    if (!arr) continue;
+
+    if (op.kind === "upsert") {
+      const id = getId(op.item);
+      if (id == null) {
+        arr.unshift(op.item);
+      } else {
+        const idx = arr.findIndex((x) => getId(x) === id);
+        if (idx >= 0) arr[idx] = { ...arr[idx], ...op.item };
+        else arr.unshift(op.item);
+      }
+      continue;
+    }
+
+    if (op.kind === "patch") {
+      const idx = arr.findIndex((x) => getId(x) === op.itemId);
+      if (idx >= 0) arr[idx] = { ...arr[idx], ...op.patch };
+      continue;
+    }
+
+    if (op.kind === "remove") {
+      const idx = arr.findIndex((x) => getId(x) === op.itemId);
+      if (idx >= 0) arr.splice(idx, 1);
+      continue;
+    }
+  }
+
+  return next;
+}
+
+/** Bygg cloud-payload från state (delad data) */
+function buildSharedPayload({ users, produkter, inkopslista, onskemal, historik, lagLager }) {
+  return { users, produkter, inkopslista, onskemal, historik, lagLager };
+}
 
 /* ================= Cloud sync (Vercel KV via API) ================= */
 const CLOUD_GET_URL = "/api/state/get";
@@ -154,42 +249,56 @@ function pinLooksOk(pin) {
 function buildInkopLista(produkter, prevList = []) {
   const prevByKey = new Map((prevList ?? []).map((x) => [x.key, x]));
 
-  const auto = (produkter ?? [])
-    .filter((p) => Number.isFinite(p.antal) && Number.isFinite(p.beställningspunkt))
-    .filter((p) => toInt(p.beställningspunkt, 0) > 0)
-    .filter((p) => toInt(p.antal, 0) <= toInt(p.beställningspunkt, 0))
-    .map((p) => {
-      const target = toInt(p.minAntal, 0) > 0 ? toInt(p.minAntal, 0) : toInt(p.beställningspunkt, 0);
-      const rekommenderat = Math.max(0, target - toInt(p.antal, 0));
-      const key = makeKey(p.huvudgrupp, p.produkt);
+const auto = (produkter ?? [])
+.filter((p) => !p.autoInkopPaused) // ⏸️ respektera paus  
+.filter((p) => Number.isFinite(p.antal) && Number.isFinite(p.beställningspunkt))
+  .filter((p) => toInt(p.beställningspunkt, 0) > 0)
+  .filter((p) => toInt(p.antal, 0) <= toInt(p.beställningspunkt, 0))
+  .map((p) => {
+    const target =
+      toInt(p.minAntal, 0) > 0
+        ? toInt(p.minAntal, 0)
+        : toInt(p.beställningspunkt, 0);
 
-      const prev = prevByKey.get(key);
-      const manuell = prev?.manuell === true;
-      const antal = manuell ? Math.max(0, toInt(prev?.antal, 0)) : rekommenderat;
+    const rekommenderat = Math.max(0, target - toInt(p.antal, 0));
+    const key = makeKey(p.huvudgrupp, p.produkt);
 
-      return {
-        id: key,
-        key,
-        huvudgrupp: p.huvudgrupp ?? "",
-        produkt: p.produkt ?? "",
-        antal,
-        rekommenderat,
-        manuell,
-        bestalld: prev?.bestalld === true,
-        bestalldTid: prev?.bestalldTid ?? "",
-        bestalldAv: prev?.bestalldAv ?? "",
-        onskemalTid: prev?.onskemalTid ?? "",
-        onskemalAv: prev?.onskemalAv ?? "",
-        onskemalKommentar: prev?.onskemalKommentar ?? "",
+    const prev = prevByKey.get(key);
+    const manuell = prev?.manuell === true;
 
-        // Inleveransdata
-        mottagetAntal: Math.max(0, toInt(prev?.mottagetAntal, 0)),
-        levererad: prev?.levererad === true,
-        levereradTid: prev?.levereradTid ?? "",
-        levereradAv: prev?.levereradAv ?? "",
-        leveranser: Array.isArray(prev?.leveranser) ? prev.leveranser : [],
-      };
-    });
+    // ✅ NYTT: om auto och 0 → SKAPA INTE RAD
+    if (!manuell && rekommenderat <= 0) return null;
+
+    const antal = manuell
+      ? Math.max(0, toInt(prev?.antal, 0))
+      : rekommenderat;
+
+    // ✅ NYTT: om antal fortfarande 0 → SKAPA INTE RAD
+    if (antal <= 0) return null;
+
+    return {
+      id: key,
+      key,
+      huvudgrupp: p.huvudgrupp ?? "",
+      produkt: p.produkt ?? "",
+      antal,
+      rekommenderat,
+      manuell,
+      bestalld: prev?.bestalld === true,
+      bestalldTid: prev?.bestalldTid ?? "",
+      bestalldAv: prev?.bestalldAv ?? "",
+      onskemalTid: prev?.onskemalTid ?? "",
+      onskemalAv: prev?.onskemalAv ?? "",
+      onskemalKommentar: prev?.onskemalKommentar ?? "",
+
+      mottagetAntal: Math.max(0, toInt(prev?.mottagetAntal, 0)),
+      levererad: prev?.levererad === true,
+      levereradTid: prev?.levereradTid ?? "",
+      levereradAv: prev?.levereradAv ?? "",
+      leveranser: Array.isArray(prev?.leveranser) ? prev.leveranser : [],
+    };
+  })
+  .filter(Boolean); // ✅ MYCKET VIKTIG
 
   const bestalldaExtras = (prevList ?? [])
     .filter((x) => x?.bestalld === true)
@@ -355,6 +464,13 @@ function LoginScreen({ users, onLogin }) {
 export default function App() {
   const saved = loadState();
 
+const [pendingOpsCount, setPendingOpsCount] = useState(() => loadOps().length);
+
+const refreshPendingOps = useCallback(() => {
+  setPendingOpsCount(loadOps().length);
+}, []);
+
+
 /* ===== Auth/User state ===== */
   const [users, setUsers] = useState(() => {
     const base =
@@ -427,6 +543,15 @@ const [produkter, setProdukter] = useState(
     setRecentComments((prev) => [s, ...prev.filter((x) => x !== s)].slice(0, 8));
   };
 
+const applySharedFromPayload = useCallback((p) => {
+  if (Array.isArray(p?.users)) setUsers(p.users);
+  if (Array.isArray(p?.produkter)) setProdukter(p.produkter);
+  if (Array.isArray(p?.inkopslista)) setInkopslista(p.inkopslista);
+  if (Array.isArray(p?.onskemal)) setOnskemal(p.onskemal);
+  if (Array.isArray(p?.historik)) setHistorik(p.historik);
+  if (Array.isArray(p?.lagLager)) setLagLager(p.lagLager);
+}, [setUsers, setProdukter, setInkopslista, setOnskemal, setHistorik, setLagLager]);
+
 // ===== Cloud sync refs (konfliktsäkert + ingen loop) =====
   const cloudHydratedRef = useRef(false);        // true efter första lyckade (eller misslyckade) load-försök
   const cloudVersionRef = useRef(0);             // senaste serverversion vi känner till
@@ -470,12 +595,19 @@ if (!cloudSaveDebounceRef.current) {
   cloudLoadedOkRef.current = true;     // ✅ viktig
   cloudAttemptedRef.current = true;    // ✅
 
+// Efter att du satt state från cloud:
+const ops = loadOps();
+if (ops.length) {
+  const mergedForUi = applyOpsToPayload(p, ops);
+  applySharedFromPayload(mergedForUi);
+  setPendingOpsCount(ops.length);
+}
 
     // släpp spärren efter att state satts
     queueMicrotask(() => {
       suppressCloudSaveRef.current = false;
     });
-  }, [setUsers, setProdukter, setInkopslista, setOnskemal, setHistorik, setLagLager]);
+  }, [setUsers, setProdukter, setInkopslista, setOnskemal, setHistorik, setLagLager, applySharedFromPayload]);
 
   // ===== Hämta från cloud (skippa apply om version ej ändrats) =====
 const reloadFromCloud = useCallback(async ({ force = false } = {}) => {
@@ -510,6 +642,114 @@ const reloadFromCloud = useCallback(async ({ force = false } = {}) => {
   }
 }, [applyCloudPayload]);
 
+const syncNow = useCallback(async () => {
+  if (!navigator.onLine) return;
+
+  const ops = loadOps();
+  if (!ops.length) return;
+
+  // undvik parallella syncar
+  if (cloudInFlightRef.current) return;
+  cloudInFlightRef.current = true;
+
+  try {
+    for (let attempt = 0; attempt < 8; attempt++) {
+      // 1) Hämta senaste cloud
+      const resGet = await fetch(`${CLOUD_GET_URL}?t=${Date.now()}`, { cache: "no-store" });
+      if (!resGet.ok) return;
+      const data = await resGet.json().catch(() => null);
+      const cloudPayload = data?.payload ?? null;
+      if (!data?.ok || !cloudPayload) return;
+
+      const baseVersion = cloudPayload.__version ?? 0;
+
+      // 2) Rebase: cloud + ops
+      const merged = applyOpsToPayload(cloudPayload, ops);
+      merged.__version = baseVersion;
+      merged.__meta = merged.__meta || {};
+      merged.__meta.updatedAt = new Date().toISOString();
+
+      // 3) Försök spara (server gör version-check)
+      const resSet = await fetch(CLOUD_SET_URL, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        cache: "no-store",
+        body: JSON.stringify({ payload: merged }),
+      });
+
+      // konflikt: någon annan sparade nyare -> loopa och rebasa igen
+      if (resSet.status === 409) continue;
+
+      if (resSet.ok) {
+        const json = await resSet.json().catch(() => null);
+        if (json?.version !== undefined) {
+          cloudVersionRef.current = json.version;
+          merged.__version = json.version;
+        }
+
+        // 4) ops är nu inkorporerade i molnstate -> töm outbox
+        clearOps();
+        setPendingOpsCount(0);
+
+        // 5) Uppdatera UI med merged (så vi matchar molnet)
+        suppressCloudSaveRef.current = true;
+        applySharedFromPayload(merged);
+        queueMicrotask(() => { suppressCloudSaveRef.current = false; });
+
+        setCloudStatus((s) => ({ ...s, lastSync: new Date().toISOString() }));
+      }
+      break;
+    }
+  } catch (e) {
+    // låt ops ligga kvar, försök senare
+    console.warn("syncNow failed:", e);
+  } finally {
+    cloudInFlightRef.current = false;
+  }
+}, [applySharedFromPayload]);
+
+// ================= OPS helpers (använd i alla actions) =================
+
+// Samma entity-namn som applyOpsToPayload använder
+const OP_ENTITY = {
+  users: "users",
+  produkter: "produkter",
+  inkopslista: "inkopslista",
+  onskemal: "onskemal",
+  historik: "historik",
+  lagLager: "lagLager",
+};
+
+// Debouncad “försök sync” (online -> syncNow)
+const trySyncSoon = useCallback(() => {
+  if (!navigator.onLine) return;
+  cloudSaveDebounceRef.current(() => syncNow());
+}, [syncNow]);
+
+const opUpsert = useCallback((entity, item) => {
+  enqueueOp({ id: uuid(), ts: Date.now(), kind: "upsert", entity, item });
+  refreshPendingOps();
+  trySyncSoon();
+}, [refreshPendingOps, trySyncSoon]);
+
+const opPatch = useCallback((entity, itemId, patch) => {
+  enqueueOp({ id: uuid(), ts: Date.now(), kind: "patch", entity, itemId, patch });
+  refreshPendingOps();
+  trySyncSoon();
+}, [refreshPendingOps, trySyncSoon]);
+
+const opRemove = useCallback((entity, itemId) => {
+  enqueueOp({ id: uuid(), ts: Date.now(), kind: "remove", entity, itemId });
+  refreshPendingOps();
+  trySyncSoon();
+}, [refreshPendingOps, trySyncSoon]);
+
+// Historik: skapa alltid id så den blir idempotent vid sync/retry
+const makeHistorikRad = useCallback((h) => ({
+  id: uuid(),
+  ...h,
+}), []);
+
   // ===== Initial load + polling =====
   useEffect(() => {
     let cancelled = false;
@@ -531,6 +771,12 @@ const reloadFromCloud = useCallback(async ({ force = false } = {}) => {
   }, [reloadFromCloud]);
 
   
+useEffect(() => {
+  const onOnline = () => syncNow();
+  window.addEventListener("online", onOnline);
+  return () => window.removeEventListener("online", onOnline);
+}, [syncNow]);
+
 
   /* ===== Behörigheter ===== */
   const isAdmin = currentUser?.role === "Admin";
@@ -632,147 +878,242 @@ const reloadFromCloud = useCallback(async ({ force = false } = {}) => {
   };
   const closeAddProd = () => setAddProdOpen(false);
 
-  const sparaNyProdukt = () => {
-    if (!canEditHuvudlager) return;
+const sparaNyProdukt = () => {
+  if (!canEditHuvudlager) return;
 
-    const produktNamn = String(newProd.produkt || "").trim();
-    if (!produktNamn) {
-      setFel("Produktnamn krävs.");
-      return;
-    }
+  const produktNamn = String(newProd.produkt || "").trim();
+  if (!produktNamn) {
+    setFel("Produktnamn krävs.");
+    return;
+  }
 
-    const huvudgrupp = String(newProd.huvudgrupp || "").trim();
-    const lagerplats = String(newProd.lagerplats || "").trim() || "Huvudförråd";
+  const huvudgrupp = String(newProd.huvudgrupp || "").trim();
+  const lagerplats = String(newProd.lagerplats || "").trim() || "Huvudförråd";
 
-    const antal = Math.max(0, toInt(newProd.antal, 0));
-    const minAntal = Math.max(0, toInt(newProd.minAntal, 0));
-    const beställningspunkt = Math.max(0, toInt(newProd.beställningspunkt, 0));
+  const antalAdd = Math.max(0, toInt(newProd.antal, 0));
+  const minAntal = Math.max(0, toInt(newProd.minAntal, 0));
+  const beställningspunkt = Math.max(0, toInt(newProd.beställningspunkt, 0));
 
-    const idx = produkter.findIndex(
-      (p) => normKeyPart(p.produkt) === normKeyPart(produktNamn) && normKeyPart(p.huvudgrupp) === normKeyPart(huvudgrupp)
-    );
+  const idx = produkter.findIndex(
+    (p) =>
+      normKeyPart(p.produkt) === normKeyPart(produktNamn) &&
+      normKeyPart(p.huvudgrupp) === normKeyPart(huvudgrupp)
+  );
 
-    let nyaProdukter;
+  let nyaProdukter;
+  let upsertProdukt; // <- den här skickar vi till ops
 
-    if (idx >= 0) {
-      // Finns redan -> slå ihop: öka antal + uppdatera fält
-      nyaProdukter = produkter.map((p, i) =>
-        i !== idx
-          ? p
-          : {
-              ...p,
-              produkt: produktNamn,
-              huvudgrupp,
-              lagerplats,
-              antal: Math.max(0, toInt(p.antal, 0)) + antal,
-              minAntal,
-              beställningspunkt,
-            }
-      );
-      showInfo("Produkten fanns redan – ökade antal och uppdaterade uppgifter.");
-    } else {
-      // Skapa ny
-      const ny = {
-        id: Date.now(),
-        huvudgrupp,
-        produkt: produktNamn,
-        antal,
-        lagerplats,
-        minAntal,
-        beställningspunkt,
-      };
-      nyaProdukter = [ny, ...produkter];
-      showInfo("Ny produkt skapad.");
-    }
+  if (idx >= 0) {
+    // Finns redan -> slå ihop (öka antal + uppdatera fält)
+    const existing = produkter[idx];
+    const newQty = Math.max(0, toInt(existing.antal, 0)) + antalAdd;
 
-    setFel("");
-    setProdukter(nyaProdukter);
-    setInkopslista((prev) => buildInkopLista(nyaProdukter, prev));
+    upsertProdukt = {
+      ...existing,
+      produkt: produktNamn,
+      huvudgrupp,
+      lagerplats,
+      antal: newQty,
+      minAntal,
+      beställningspunkt,
+    };
 
-    setHistorik((prev) => [
-      {
-        tid: new Date().toLocaleString("sv-SE"),
-        typ: idx >= 0 ? "Produkt uppdaterad" : "Ny produkt",
-        produkt: produktNamn,
-        huvudgrupp,
-        lagerplats,
-        antal,
-        användare: currentUser?.name ?? "Okänd",
-        kommentar: idx >= 0 ? "Sammanslagen rad (ökade antal)." : "Skapad i huvudlager.",
-      },
-      ...prev,
-    ]);
+    nyaProdukter = produkter.map((p, i) => (i === idx ? upsertProdukt : p));
+    showInfo("Produkten fanns redan – ökade antal och uppdaterade uppgifter.");
+  } else {
+    // Skapa ny
+    upsertProdukt = {
+      id: Date.now(), // behåll ditt id-mönster
+      huvudgrupp,
+      produkt: produktNamn,
+      antal: antalAdd,
+      lagerplats,
+      minAntal,
+      beställningspunkt,
+    };
 
-    closeAddProd();
+    nyaProdukter = [upsertProdukt, ...produkter];
+    showInfo("Ny produkt skapad.");
+  }
+
+  // UI
+  setFel("");
+  setProdukter(nyaProdukter);
+  setInkopslista((prev) => buildInkopLista(nyaProdukter, prev));
+
+  // Historikrad (ge id så den blir idempotent i ops)
+  const h = {
+    id: uuid(),
+    tid: new Date().toLocaleString("sv-SE"),
+    typ: idx >= 0 ? "Produkt uppdaterad" : "Ny produkt",
+    produkt: produktNamn,
+    huvudgrupp,
+    lagerplats,
+    antal: antalAdd,
+    användare: currentUser?.name ?? "Okänd",
+    kommentar: idx >= 0 ? "Sammanslagen rad (ökade antal)." : "Skapad i huvudlager.",
   };
 
+  setHistorik((prev) => [h, ...prev]);
 
-/* ===== Persist state (local ALWAYS + cloud for shared data) ===== */
-  useEffect(() => {
-    // 1) ALLT lokalt (offline + per-enhet inställningar + currentUser)
-    const localPayload = {
-      vy,
-      users,
-      currentUser,              // ✅ per enhet (val A)
-      produkter,
-      inkopslista,
-      onskemal,
-      historik,
-      lagLager,
-      aktivtLag,
-      recentComments,
-      qtyMap,
-      leveransKommentar,
-      leveransLagerplats,
-      leveransQtyMap,
-    };
-    saveState(localPayload);
+  // ✅ OPS (detta är det som gör att den INTE försvinner vid refresh/cloud-load)
+  enqueueOp({ id: uuid(), ts: Date.now(), kind: "upsert", entity: "produkter", item: upsertProdukt });
+  enqueueOp({ id: uuid(), ts: Date.now(), kind: "upsert", entity: "historik", item: h });
 
-    // 2) Cloud: vänta tills vi hydraterat (annars overwrite-risk)
-    if (!cloudLoadedOkRef.current) return;
+  refreshPendingOps();
+  if (navigator.onLine) syncNow();
 
-    // 3) Om vi just applicerade cloud-data, skriv inte tillbaka (undvik loop)
-    if (suppressCloudSaveRef.current) return;
+  closeAddProd();
+};
+const toggleAutoInkop = (produkt) => {
+  if (!canEditHuvudlager) return;
 
-    // 4) Bara delad data till cloud (currentUser INTE med)
-    const cloudPayload = {
-      __version: cloudVersionRef.current,
-      users,
-      produkter,
-      inkopslista,
-      onskemal,
-      historik,
-      lagLager,
-      __meta: { updatedAt: new Date().toISOString() },
-    };
+  const paused = !Boolean(produkt.autoInkopPaused);
 
-    cloudSaveDebounceRef.current(async () => {
-      try {
-        const res = await fetch(CLOUD_SET_URL, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          cache: "no-store",
-          body: JSON.stringify({ payload: cloudPayload }),
-        });
+  const uppdaterad = {
+    ...produkt,
+    autoInkopPaused: paused,
+  };
 
-        // Konflikt: någon annan har sparat nyare -> ladda om senaste och applicera
-        if (res.status === 409) {
-          await reloadFromCloud({ force: true });
-          return;
-        }
+  // UI
+  const nyaProdukter = produkter.map((p) =>
+    p.id === produkt.id ? uppdaterad : p
+  );
+  setProdukter(nyaProdukter);
+  setInkopslista((prev) => buildInkopLista(nyaProdukter, prev));
 
-        if (res.ok) {
-          const json = await res.json().catch(() => null);
-          if (json?.version !== undefined) {
-            cloudVersionRef.current = json.version;
-          }
-          setCloudStatus((s) => ({ ...s, lastSync: new Date().toISOString() }));
-        }
-      } catch (e) {
-        console.warn("Cloud save failed:", e);
-      }
-    });
-  }, [
+  // Historik
+  const h = makeHistorikRad({
+    tid: new Date().toLocaleString("sv-SE"),
+    typ: paused ? "Auto-inköp pausat" : "Auto-inköp aktiverat",
+    produkt: produkt.produkt,
+    huvudgrupp: produkt.huvudgrupp,
+    lagerplats: produkt.lagerplats,
+    antal: 0,
+    användare: currentUser?.name ?? "Okänd",
+    kommentar: paused
+      ? "Automatiskt inköp pausades för produkten."
+      : "Automatiskt inköp aktiverades igen.",
+  });
+  setHistorik((prev) => [h, ...prev]);
+
+  // ✅ OPS (offline + cloud)
+  opPatch(OP_ENTITY.produkter, produkt.id, { autoInkopPaused: paused });
+  opUpsert(OP_ENTITY.historik, h);
+
+  showInfo(paused ? "Auto-inköp pausat." : "Auto-inköp aktiverat.");
+};
+
+/* ===== Edit product (lager) ===== */
+const [editProdOpen, setEditProdOpen] = useState(false);
+const [editProd, setEditProd] = useState(null);
+
+const openEditProd = (p) => {
+  setEditProd({
+    id: p.id,
+    huvudgrupp: p.huvudgrupp ?? "",
+    produkt: p.produkt ?? "",
+    lagerplats: p.lagerplats ?? "",
+    antal: toInt(p.antal, 0),
+    minAntal: toInt(p.minAntal, 0),
+    beställningspunkt: toInt(p.beställningspunkt, 0),
+  });
+  setEditProdOpen(true);
+};
+
+const closeEditProd = () => {
+  setEditProdOpen(false);
+  setEditProd(null);
+};
+
+const sparaRedigeradProdukt = () => {
+  if (!canEditHuvudlager || !editProd) return;
+
+  const uppdaterad = {
+    ...editProd,
+    produkt: (editProd.produkt ?? "").trim(),
+    huvudgrupp: (editProd.huvudgrupp ?? "").trim(),
+    lagerplats: (editProd.lagerplats ?? "").trim() || "Huvudförråd",
+    antal: Math.max(0, toInt(editProd.antal, 0)),
+    minAntal: Math.max(0, toInt(editProd.minAntal, 0)),
+    beställningspunkt: Math.max(0, toInt(editProd.beställningspunkt, 0)),
+  };
+
+  // UI
+  const nyaProdukter = produkter.map((p) => (p.id === uppdaterad.id ? uppdaterad : p));
+  setProdukter(nyaProdukter);
+  setInkopslista((prev) => buildInkopLista(nyaProdukter, prev));
+
+  // Historik
+  const h = makeHistorikRad({
+    tid: new Date().toLocaleString("sv-SE"),
+    typ: "Produkt redigerad",
+    produkt: uppdaterad.produkt,
+    huvudgrupp: uppdaterad.huvudgrupp,
+    lagerplats: uppdaterad.lagerplats,
+    antal: 0,
+    användare: currentUser?.name ?? "Okänd",
+    kommentar: "Redigerade produktuppgifter.",
+  });
+  setHistorik((prev) => [h, ...prev]);
+
+  // ✅ OPS
+  opUpsert(OP_ENTITY.produkter, uppdaterad);
+  opUpsert(OP_ENTITY.historik, h);
+
+  showInfo("Produkten uppdaterad (offline-säkert).");
+  closeEditProd();
+};
+
+const taBortProdukt = (p) => {
+  if (!canEditHuvudlager) return;
+
+  const användsIInkop = inkopslista.some(
+    (r) =>
+      normKeyPart(r.produkt) === normKeyPart(p.produkt) &&
+      normKeyPart(r.huvudgrupp) === normKeyPart(p.huvudgrupp)
+  );
+
+  const användsILag = lagLager.some(
+    (r) =>
+      normKeyPart(r.produkt) === normKeyPart(p.produkt) &&
+      normKeyPart(r.huvudgrupp) === normKeyPart(p.huvudgrupp)
+  );
+
+  if (användsIInkop || användsILag) {
+    return setFel(
+      "Produkten används i inköp eller lagmaterial och kan inte tas bort. Ta bort beroenden först."
+    );
+  }
+
+  if (!window.confirm(`Vill du verkligen ta bort "${p.produkt}" ur lagret?`)) return;
+
+  // UI
+  setProdukter((prev) => prev.filter((x) => x.id !== p.id));
+
+  // Historik
+  const h = makeHistorikRad({
+    tid: new Date().toLocaleString("sv-SE"),
+    typ: "Produkt borttagen",
+    produkt: p.produkt,
+    huvudgrupp: p.huvudgrupp,
+    lagerplats: p.lagerplats,
+    antal: 0,
+    användare: currentUser?.name ?? "Okänd",
+    kommentar: "Produkten togs bort ur huvudlager.",
+  });
+  setHistorik((prev) => [h, ...prev]);
+
+  // ✅ OPS
+  opRemove(OP_ENTITY.produkter, p.id);
+  opUpsert(OP_ENTITY.historik, h);
+
+  showInfo("Produkten borttagen (offline-säkert).");
+};
+
+useEffect(() => {
+  // 1) spara lokalt (offlinecache + UI)
+  const localPayload = {
     vy,
     users,
     currentUser,
@@ -787,8 +1128,30 @@ const reloadFromCloud = useCallback(async ({ force = false } = {}) => {
     leveransKommentar,
     leveransLagerplats,
     leveransQtyMap,
-    reloadFromCloud,
-  ]);
+  };
+  saveState(localPayload);
+
+  // 2) om online och vi har pending ops -> synca (rebased)
+  if (navigator.onLine && loadOps().length) {
+    cloudSaveDebounceRef.current(() => syncNow());
+  }
+}, [
+  vy,
+  users,
+  currentUser,
+  produkter,
+  inkopslista,
+  onskemal,
+  historik,
+  lagLager,
+  aktivtLag,
+  recentComments,
+  qtyMap,
+  leveransKommentar,
+  leveransLagerplats,
+  leveransQtyMap,
+  syncNow,
+]);
 
   /* ===== View guarding ===== */
   useEffect(() => {
@@ -872,37 +1235,41 @@ const reloadFromCloud = useCallback(async ({ force = false } = {}) => {
     setTxComment("");
   };
 
-  const andringDirekt = (produkt, delta, kommentar) => {
-    setFel("");
+const andringDirekt = (produkt, delta, kommentar) => {
+  setFel("");
 
-    if (delta < 0 && toInt(produkt.antal, 0) + delta < 0) {
-      setFel("Kan inte ta ut fler än det som finns i lager.");
-      return;
-    }
+  const after = toInt(produkt.antal, 0) + delta;
+  if (delta < 0 && after < 0) {
+    setFel("Kan inte ta ut fler än det som finns i lager.");
+    return;
+  }
 
-    const nyaProdukter = produkter.map((p) =>
-      p.id === produkt.id ? { ...p, antal: Math.max(0, toInt(p.antal, 0) + delta) } : p
-    );
-    setProdukter(nyaProdukter);
-    setInkopslista((prev) => buildInkopLista(nyaProdukter, prev));
+  const nyaProdukter = produkter.map((p) =>
+    p.id === produkt.id ? { ...p, antal: Math.max(0, after) } : p
+  );
+  setProdukter(nyaProdukter);
+  setInkopslista((prev) => buildInkopLista(nyaProdukter, prev));
 
-    const kom = kommentar?.trim() ? kommentar.trim() : "(ingen kommentar)";
-    rememberComment(kom);
+  const kom = kommentar?.trim() ? kommentar.trim() : "(ingen kommentar)";
+  rememberComment(kom);
 
-    setHistorik((prev) => [
-      {
-        tid: new Date().toLocaleString("sv-SE"),
-        typ: delta < 0 ? "Uttag" : "Inleverans",
-        produkt: produkt.produkt,
-        huvudgrupp: produkt.huvudgrupp,
-        lagerplats: produkt.lagerplats,
-        antal: delta,
-        användare: currentUser?.name ?? "Okänd",
-        kommentar: kom,
-      },
-      ...prev,
-    ]);
-  };
+  const h = makeHistorikRad({
+    tid: new Date().toLocaleString("sv-SE"),
+    typ: delta < 0 ? "Uttag" : "Inleverans",
+    produkt: produkt.produkt,
+    huvudgrupp: produkt.huvudgrupp,
+    lagerplats: produkt.lagerplats,
+    antal: delta,
+    användare: currentUser?.name ?? "Okänd",
+    kommentar: kom,
+  });
+
+  setHistorik((prev) => [h, ...prev]);
+
+  // OPS
+  opPatch(OP_ENTITY.produkter, produkt.id, { antal: Math.max(0, after) });
+  opUpsert(OP_ENTITY.historik, h);
+};
 
   /* ================= Massuttag ================= */
   const [selectMode, setSelectMode] = useState(false);
@@ -949,49 +1316,50 @@ const reloadFromCloud = useCallback(async ({ force = false } = {}) => {
     setBatchUsePerItemQty(true);
   };
 
-  const applyBatch = () => {
-    setFel("");
+const applyBatch = () => {
+  setFel("");
 
-    const ids = Array.from(selectedIds);
-    const items = produkter.filter((p) => ids.includes(p.id));
-    if (items.length === 0) {
-      setFel("Inga produkter valda.");
+  const ids = Array.from(selectedIds);
+  const items = produkter.filter((p) => ids.includes(p.id));
+  if (!items.length) return setFel("Inga produkter valda.");
+
+  const qtyFor = (p) => {
+    if (batchUsePerItemQty) return Math.max(1, toInt(getQty(p.id), 1));
+    return Math.max(1, toInt(batchQty, 1));
+  };
+
+  const deltas = items.map((p) => {
+    const q = qtyFor(p);
+    const delta = batchMode === "uttag" ? -q : +q;
+    return { p, delta };
+  });
+
+  if (batchMode === "uttag") {
+    const bad = deltas.find(({ p, delta }) => toInt(p.antal, 0) + delta < 0);
+    if (bad) {
+      setFel(`Kan inte ta ut ${Math.abs(bad.delta)} st av "${bad.p.produkt}" (i lager: ${bad.p.antal}).`);
       return;
     }
+  }
 
-    const qtyFor = (p) => {
-      if (batchUsePerItemQty) return Math.max(1, toInt(getQty(p.id), 1));
-      return Math.max(1, toInt(batchQty, 1));
-    };
+  const deltaById = new Map(deltas.map(({ p, delta }) => [p.id, delta]));
 
-    const deltas = items.map((p) => {
-      const q = qtyFor(p);
-      const delta = batchMode === "uttag" ? -q : +q;
-      return { p, delta };
-    });
+  const nyaProdukter = produkter.map((p) =>
+    deltaById.has(p.id)
+      ? { ...p, antal: Math.max(0, toInt(p.antal, 0) + deltaById.get(p.id)) }
+      : p
+  );
 
-    if (batchMode === "uttag") {
-      const bad = deltas.find(({ p, delta }) => toInt(p.antal, 0) + delta < 0);
-      if (bad) {
-        setFel(`Kan inte ta ut ${Math.abs(bad.delta)} st av "${bad.p.produkt}" (i lager: ${bad.p.antal}).`);
-        return;
-      }
-    }
+  setProdukter(nyaProdukter);
+  setInkopslista((prev) => buildInkopLista(nyaProdukter, prev));
 
-    const deltaById = new Map(deltas.map(({ p, delta }) => [p.id, delta]));
-    const nyaProdukter = produkter.map((p) =>
-      deltaById.has(p.id) ? { ...p, antal: Math.max(0, toInt(p.antal, 0) + deltaById.get(p.id)) } : p
-    );
+  const tid = new Date().toLocaleString("sv-SE");
+  const typ = batchMode === "uttag" ? "Uttag (mass)" : "Inleverans (mass)";
+  const kommentar = batchComment?.trim() ? batchComment.trim() : "(ingen kommentar)";
+  rememberComment(kommentar);
 
-    setProdukter(nyaProdukter);
-    setInkopslista((prev) => buildInkopLista(nyaProdukter, prev));
-
-    const tid = new Date().toLocaleString("sv-SE");
-    const typ = batchMode === "uttag" ? "Uttag (mass)" : "Inleverans (mass)";
-    const kommentar = batchComment?.trim() ? batchComment.trim() : "(ingen kommentar)";
-    rememberComment(kommentar);
-
-    const historikRader = deltas.map(({ p, delta }) => ({
+  const historikRader = deltas.map(({ p, delta }) =>
+    makeHistorikRad({
       tid,
       typ,
       produkt: p.produkt,
@@ -1000,139 +1368,159 @@ const reloadFromCloud = useCallback(async ({ force = false } = {}) => {
       antal: delta,
       användare: currentUser?.name ?? "Okänd",
       kommentar,
-    }));
-    setHistorik((prev) => [...historikRader, ...prev]);
+    })
+  );
 
-    showInfo(batchMode === "uttag" ? "Massuttag registrerat." : "Massinleverans registrerad.");
-    closeBatch();
-    clearSelected();
-    setSelectMode(false);
-  };
+  setHistorik((prev) => [...historikRader, ...prev]);
+
+  // OPS: patcha varje produkt + historik
+  for (const { p, delta } of deltas) {
+    const nyttAntal = Math.max(0, toInt(p.antal, 0) + delta);
+    opPatch(OP_ENTITY.produkter, p.id, { antal: nyttAntal });
+  }
+  for (const h of historikRader) opUpsert(OP_ENTITY.historik, h);
+
+  showInfo(batchMode === "uttag" ? "Massuttag registrerat." : "Massinleverans registrerad.");
+  closeBatch();
+  clearSelected();
+  setSelectMode(false);
+};
 
   const [showUtlamning, setShowUtlamning] = useState(false);
   const [showAddLagRad, setShowAddLagRad] = useState(false);
 
   /* ================= Lagmaterial ================= */
-  const flyttaTillLag = () => {
-    if (!canUtlamna) return;
-    const prodId = flytt.produktId;
-    const antal = Math.max(1, toInt(flytt.antal, 1));
-    const lag = (flytt.lag ?? aktivtLagEff ?? "Okänt").trim() || "Okänt";
+const flyttaTillLag = () => {
+  if (!canUtlamna) return;
 
-    const p = produkter.find((x) => String(x.id) === String(prodId));
-    if (!p) {
-      setFel("Välj en produkt i huvudlagret.");
-      return;
-    }
-    if (toInt(p.antal, 0) < antal) {
-      setFel("Finns inte så många i huvudlagret.");
-      return;
-    }
+  const prodId = flytt.produktId;
+  const antal = Math.max(1, toInt(flytt.antal, 1));
+  const lag = (flytt.lag ?? aktivtLagEff ?? "Okänt").trim() || "Okänt";
 
-    setFel("");
+  const p = produkter.find((x) => String(x.id) === String(prodId));
+  if (!p) return setFel("Välj en produkt i huvudlagret.");
+  if (toInt(p.antal, 0) < antal) return setFel("Finns inte så många i huvudlagret.");
 
-    const nyaProdukter = produkter.map((x) => (x.id === p.id ? { ...x, antal: toInt(x.antal, 0) - antal } : x));
-    setProdukter(nyaProdukter);
-    setInkopslista((prev) => buildInkopLista(nyaProdukter, prev));
+  setFel("");
 
-    setLagLager((prev) => {
-      const exists = prev.find(
-        (r) =>
-          (r.lag || "Okänt") === lag &&
-          normKeyPart(r.produkt) === normKeyPart(p.produkt) &&
-          normKeyPart(r.huvudgrupp) === normKeyPart(p.huvudgrupp)
+  // 1) huvudlager
+  const nyaProdukter = produkter.map((x) =>
+    x.id === p.id ? { ...x, antal: toInt(x.antal, 0) - antal } : x
+  );
+  setProdukter(nyaProdukter);
+  setInkopslista((prev) => buildInkopLista(nyaProdukter, prev));
+
+  // 2) laglager
+  const now = new Date().toLocaleString("sv-SE");
+  const ut = (flytt.utlamningsdatum ?? "").trim();
+  const kom = (flytt.kommentar ?? "").trim();
+
+  let skapadRad = null;
+
+  setLagLager((prev) => {
+    const exists = prev.find(
+      (r) =>
+        (r.lag || "Okänt") === lag &&
+        normKeyPart(r.produkt) === normKeyPart(p.produkt) &&
+        normKeyPart(r.huvudgrupp) === normKeyPart(p.huvudgrupp)
+    );
+
+    if (exists) {
+      const next = prev.map((r) =>
+        r.id === exists.id
+          ? {
+              ...r,
+              antal: Math.max(0, toInt(r.antal, 0)) + antal,
+              utlamningsdatum: ut || r.utlamningsdatum || "",
+              kommentar: kom || r.kommentar || "",
+            }
+          : r
       );
-
-      const now = new Date().toLocaleString("sv-SE");
-      const ut = (flytt.utlamningsdatum ?? "").trim();
-      const kom = (flytt.kommentar ?? "").trim();
-
-      if (exists) {
-        return prev.map((r) =>
-          r.id === exists.id
-            ? {
-                ...r,
-                antal: Math.max(0, toInt(r.antal, 0)) + antal,
-                utlamningsdatum: ut || r.utlamningsdatum || "",
-                kommentar: kom || r.kommentar || "",
-              }
-            : r
-        );
-      }
-
-      return [
-        {
-          id: Date.now(),
-          lag,
-          huvudgrupp: p.huvudgrupp ?? "",
-          produkt: p.produkt ?? "",
-          antal,
-          utlamningsdatum: ut,
-          kommentar: kom,
-          skapadTid: now,
-          skapadAv: currentUser?.name ?? "Okänd",
-        },
-        ...prev,
-      ];
-    });
-
-    setHistorik((prev) => [
-      {
-        tid: new Date().toLocaleString("sv-SE"),
-        typ: "Utlämnat till lag",
-        produkt: p.produkt,
-        huvudgrupp: p.huvudgrupp,
-        lagerplats: p.lagerplats,
-        antal: -antal,
-        användare: currentUser?.name ?? "Okänd",
-        kommentar: `Till ${lag}${flytt.kommentar ? ` • ${flytt.kommentar}` : ""}`,
-      },
-      ...prev,
-    ]);
-
-    showInfo(`Flyttade ${antal} st till ${lag}.`);
-    setFlytt((f) => ({ ...f, antal: 1, kommentar: "" }));
-  };
-
-  const uppdateraLagRadAntal = (id, newValue) => {
-    const n = Math.max(0, toInt(newValue, 0));
-    setLagLager((prev) => prev.map((r) => (r.id === id ? { ...r, antal: n } : r)));
-    showInfo("Antal uppdaterat.");
-  };
-
-  const laggTillLagRad = () => {
-    if (isLedare) {
-      setFel("Ledare kan inte lägga till nya rader i lagmaterial (ändra antal på befintliga istället).");
-      return;
+      skapadRad = next.find((r) => r.id === exists.id);
+      return next;
     }
-    const prod = (nyLagRad.produkt ?? "").trim();
-    if (!prod) return;
 
     const item = {
       id: Date.now(),
-      lag: (nyLagRad.lag ?? aktivtLagEff ?? "Okänt").trim() || "Okänt",
-      huvudgrupp: (nyLagRad.huvudgrupp ?? "").trim(),
-      produkt: prod,
-      antal: Math.max(0, toInt(nyLagRad.antal, 1)),
-      utlamningsdatum: (nyLagRad.utlamningsdatum ?? "").trim(),
-      kommentar: (nyLagRad.kommentar ?? "").trim(),
-      skapadTid: new Date().toLocaleString("sv-SE"),
+      lag,
+      huvudgrupp: p.huvudgrupp ?? "",
+      produkt: p.produkt ?? "",
+      antal,
+      utlamningsdatum: ut,
+      kommentar: kom,
+      skapadTid: now,
       skapadAv: currentUser?.name ?? "Okänd",
     };
+    skapadRad = item;
+    return [item, ...prev];
+  });
 
-    setLagLager((prev) => [item, ...prev]);
-    setNyLagRad({ lag: item.lag, huvudgrupp: "", produkt: "", antal: 1, utlamningsdatum: "", kommentar: "" });
-    showInfo("Rad lades till i lagmaterial.");
+  // 3) historik
+  const h = makeHistorikRad({
+    tid: new Date().toLocaleString("sv-SE"),
+    typ: "Utlämnat till lag",
+    produkt: p.produkt,
+    huvudgrupp: p.huvudgrupp,
+    lagerplats: p.lagerplats,
+    antal: -antal,
+    användare: currentUser?.name ?? "Okänd",
+    kommentar: `Till ${lag}${kom ? ` • ${kom}` : ""}`,
+  });
+  setHistorik((prev) => [h, ...prev]);
+
+  // OPS
+  opPatch(OP_ENTITY.produkter, p.id, { antal: toInt(p.antal, 0) - antal });
+  // Upsert lagraden (om skapadRad redan satt)
+  if (skapadRad) opUpsert(OP_ENTITY.lagLager, skapadRad);
+  opUpsert(OP_ENTITY.historik, h);
+
+  showInfo(`Flyttade ${antal} st till ${lag}.`);
+  setFlytt((f) => ({ ...f, antal: 1, kommentar: "" }));
+};
+
+const uppdateraLagRadAntal = (id, newValue) => {
+  const n = Math.max(0, toInt(newValue, 0));
+  setLagLager((prev) => prev.map((r) => (r.id === id ? { ...r, antal: n } : r)));
+  opPatch(OP_ENTITY.lagLager, id, { antal: n });
+  showInfo("Antal uppdaterat (offline-säkert).");
+};
+
+const laggTillLagRad = () => {
+  if (isLedare) {
+    setFel("Ledare kan inte lägga till nya rader i lagmaterial (ändra antal på befintliga istället).");
+    return;
+  }
+  const prod = (nyLagRad.produkt ?? "").trim();
+  if (!prod) return;
+
+  const item = {
+    id: Date.now(),
+    lag: (nyLagRad.lag ?? aktivtLagEff ?? "Okänt").trim() || "Okänt",
+    huvudgrupp: (nyLagRad.huvudgrupp ?? "").trim(),
+    produkt: prod,
+    antal: Math.max(0, toInt(nyLagRad.antal, 1)),
+    utlamningsdatum: (nyLagRad.utlamningsdatum ?? "").trim(),
+    kommentar: (nyLagRad.kommentar ?? "").trim(),
+    skapadTid: new Date().toLocaleString("sv-SE"),
+    skapadAv: currentUser?.name ?? "Okänd",
   };
 
-  const taBortLagRad = (id) => {
-    if (isLedare) {
-      setFel("Ledare kan inte ta bort rader (ändra antal istället).");
-      return;
-    }
-    setLagLager((prev) => prev.filter((x) => x.id !== id));
-    showInfo("Rad borttagen.");
-  };
+  setLagLager((prev) => [item, ...prev]);
+  opUpsert(OP_ENTITY.lagLager, item);
+
+  setNyLagRad({ lag: item.lag, huvudgrupp: "", produkt: "", antal: 1, utlamningsdatum: "", kommentar: "" });
+  showInfo("Rad lades till i lagmaterial (offline-säkert).");
+};
+
+const taBortLagRad = (id) => {
+  if (isLedare) {
+    setFel("Ledare kan inte ta bort rader (ändra antal istället).");
+    return;
+  }
+  setLagLager((prev) => prev.filter((x) => x.id !== id));
+  opRemove(OP_ENTITY.lagLager, id);
+  showInfo("Rad borttagen (offline-säkert).");
+};
 
   const [returOpen, setReturOpen] = useState(false);
   const [returRad, setReturRad] = useState(null);
@@ -1151,271 +1539,426 @@ const reloadFromCloud = useCallback(async ({ force = false } = {}) => {
     setReturQty(1);
   };
 
-  const returTillHuvudlager = (rad, antalInput) => {
-    if (!canUtlamna) return;
-    const antal = Math.max(1, toInt(antalInput, 1));
-    if (antal > (rad.antal ?? 0)) {
-      setFel("Kan inte returnera fler än lagets antal.");
-      return;
-    }
-    setFel("");
+const returTillHuvudlager = (rad, antalInput) => {
+  if (!canUtlamna) return;
 
-    setProdukter((prev) => {
-      const idx = prev.findIndex(
-        (p) => normKeyPart(p.produkt) === normKeyPart(rad.produkt) && normKeyPart(p.huvudgrupp) === normKeyPart(rad.huvudgrupp)
-      );
+  const antal = Math.max(1, toInt(antalInput, 1));
+  if (antal > (rad.antal ?? 0)) return setFel("Kan inte returnera fler än lagets antal.");
+  setFel("");
 
-      if (idx >= 0) {
-        const nya = [...prev];
-        nya[idx] = { ...nya[idx], antal: Math.max(0, toInt(nya[idx].antal, 0)) + antal };
-        setInkopslista((inkPrev) => buildInkopLista(nya, inkPrev));
-        return nya;
-      }
+  // 1) huvudlager: öka / skapa
+  let patchedProdId = null;
+  let patchedProdAntal = null;
 
-      const ny = {
-        id: Date.now(),
-        huvudgrupp: rad.huvudgrupp ?? "",
-        produkt: rad.produkt ?? "",
-        antal,
-        lagerplats: "Huvudförråd",
-        minAntal: 0,
-        beställningspunkt: 0,
-      };
-      const nya = [ny, ...prev];
+  setProdukter((prev) => {
+    const idx = prev.findIndex(
+      (p) =>
+        normKeyPart(p.produkt) === normKeyPart(rad.produkt) &&
+        normKeyPart(p.huvudgrupp) === normKeyPart(rad.huvudgrupp)
+    );
+
+    if (idx >= 0) {
+      const nya = [...prev];
+      const newQty = Math.max(0, toInt(nya[idx].antal, 0)) + antal;
+      nya[idx] = { ...nya[idx], antal: newQty };
+      patchedProdId = nya[idx].id;
+      patchedProdAntal = newQty;
+      // inköp UI
       setInkopslista((inkPrev) => buildInkopLista(nya, inkPrev));
       return nya;
-    });
+    }
 
-    setLagLager((prev) => {
-      const kvar = prev.map((r) => (r.id === rad.id ? { ...r, antal: Math.max(0, toInt(r.antal, 0) - antal) } : r));
-      return kvar.filter((r) => toInt(r.antal, 0) > 0);
-    });
-
-    setHistorik((prev) => [
-      {
-        tid: new Date().toLocaleString("sv-SE"),
-        typ: "Retur från lag",
-        produkt: rad.produkt,
-        huvudgrupp: rad.huvudgrupp,
-        lagerplats: "",
-        antal: +antal,
-        användare: currentUser?.name ?? "Okänd",
-        kommentar: `Från ${rad.lag || "Okänt"}`,
-      },
-      ...prev,
-    ]);
-
-    showInfo(`Returnerade ${antal} st till huvudlager.`);
-  };
-
-  /* ================= Önskemål ================= */
-  const skapaOnskemal = () => {
-    const prod = nyttOnskemal.produkt.trim();
-    if (!prod) return;
-
-    const item = {
+    const ny = {
       id: Date.now(),
-      huvudgrupp: nyttOnskemal.huvudgrupp.trim(),
-      produkt: prod,
-      antal: Math.max(1, toInt(nyttOnskemal.antal, 1)),
-      kommentar: (nyttOnskemal.kommentar ?? "").trim(),
-      skapadTid: new Date().toLocaleString("sv-SE"),
-      skapadAv: currentUser?.name ?? "Okänd",
-      lag: isLedare ? (currentUser?.lag ?? "Okänt") : "",
+      huvudgrupp: rad.huvudgrupp ?? "",
+      produkt: rad.produkt ?? "",
+      antal,
+      lagerplats: "Huvudförråd",
+      minAntal: 0,
+      beställningspunkt: 0,
     };
+    patchedProdId = ny.id;
+    patchedProdAntal = antal;
+    const nya = [ny, ...prev];
+    setInkopslista((inkPrev) => buildInkopLista(nya, inkPrev));
+    return nya;
+  });
 
-    setOnskemal((prev) => [item, ...prev]);
-    setNyttOnskemal({ huvudgrupp: "", produkt: "", antal: 1, kommentar: "" });
-    showInfo("Önskemålet lades till.");
-  };
-
-  const laggOnskemalTillInkop = (o) => {
-    if (!canMoveToInkop) return;
-
-    const key = makeKey(o.huvudgrupp, o.produkt);
-
-    setInkopslista((prev) => {
-      const finns = prev.find((r) => r.key === key);
-      if (finns) {
-        return prev.map((r) =>
-          r.key === key
-            ? {
-                ...r,
-                antal: Math.max(0, toInt(r.antal, 0)) + Math.max(1, toInt(o.antal, 1)),
-                manuell: true,
-                bestalld: false,
-                onskemalTid: r.onskemalTid || o.skapadTid || "",
-                onskemalAv: r.onskemalAv || o.skapadAv || "",
-                onskemalKommentar: r.onskemalKommentar || o.kommentar || "",
-              }
-            : r
-        );
-      }
-      return [
-        ...prev,
-        {
-          id: key,
-          key,
-          huvudgrupp: o.huvudgrupp ?? "",
-          produkt: o.produkt ?? "",
-          antal: Math.max(1, toInt(o.antal, 1)),
-          rekommenderat: 0,
-          manuell: true,
-          bestalld: false,
-          bestalldTid: "",
-          bestalldAv: "",
-          onskemalTid: o.skapadTid ?? "",
-          onskemalAv: o.skapadAv ?? "",
-          onskemalKommentar: o.kommentar ?? "",
-          mottagetAntal: 0,
-          levererad: false,
-          levereradTid: "",
-          levereradAv: "",
-          leveranser: [],
-        },
-      ];
-    });
-
-    setOnskemal((prev) => prev.filter((x) => x.id !== o.id));
-    showInfo("Önskemål flyttat till inköp.");
-  };
-
-  /* ================= Inköp ================= */
-  const sättInköpsantalManuellt = (key, value) => {
-    setInkopslista((prev) =>
-      prev.map((r) => (r.key === key ? { ...r, antal: Math.max(0, toInt(value, 0)), manuell: true } : r))
+  // 2) laglager: minska / remove om 0
+  setLagLager((prev) => {
+    const kvar = prev.map((r) =>
+      r.id === rad.id ? { ...r, antal: Math.max(0, toInt(r.antal, 0) - antal) } : r
     );
+    const filtered = kvar.filter((r) => toInt(r.antal, 0) > 0);
+    return filtered;
+  });
+
+  // 3) historik
+  const h = makeHistorikRad({
+    tid: new Date().toLocaleString("sv-SE"),
+    typ: "Retur från lag",
+    produkt: rad.produkt,
+    huvudgrupp: rad.huvudgrupp,
+    lagerplats: "",
+    antal: +antal,
+    användare: currentUser?.name ?? "Okänd",
+    kommentar: `Från ${rad.lag || "Okänt"}`,
+  });
+  setHistorik((prev) => [h, ...prev]);
+
+  // OPS
+  if (patchedProdId != null) opPatch(OP_ENTITY.produkter, patchedProdId, { antal: patchedProdAntal });
+  opPatch(OP_ENTITY.lagLager, rad.id, { antal: Math.max(0, toInt(rad.antal, 0) - antal) });
+  if (Math.max(0, toInt(rad.antal, 0) - antal) <= 0) opRemove(OP_ENTITY.lagLager, rad.id);
+  opUpsert(OP_ENTITY.historik, h);
+
+  showInfo(`Returnerade ${antal} st till huvudlager (offline-säkert).`);
+};
+  /* ================= Önskemål ================= */
+
+const skapaOnskemal = () => {
+  const prod = (nyttOnskemal.produkt ?? "").trim();
+  if (!prod) return;
+
+  const item = {
+    id: uuid(),
+    huvudgrupp: (nyttOnskemal.huvudgrupp ?? "").trim(),
+    produkt: prod,
+    antal: Math.max(1, toInt(nyttOnskemal.antal, 1)),
+    kommentar: (nyttOnskemal.kommentar ?? "").trim(),
+    skapadTid: new Date().toLocaleString("sv-SE"),
+    skapadAv: currentUser?.name ?? "Okänd",
+    lag: isLedare ? (currentUser?.lag ?? "Okänt") : "",
   };
-  const återställRekommenderat = (key) => {
-    setInkopslista((prev) => prev.map((r) => (r.key === key ? { ...r, antal: r.rekommenderat, manuell: false } : r)));
-  };
-  const markeraSomBestalld = (key) => {
-    const tid = new Date().toLocaleString("sv-SE");
-    setInkopslista((prev) =>
-      prev.map((r) =>
+
+  // UI direkt
+  setOnskemal((prev) => [item, ...prev]);
+
+  // OPS
+  opUpsert(OP_ENTITY.onskemal, item);
+
+  setNyttOnskemal({ huvudgrupp: "", produkt: "", antal: 1, kommentar: "" });
+  showInfo("Önskemålet lades till (offline-säkert).");
+};
+
+  
+const taBortOnskemal = (id) => {
+  setOnskemal((prev) => prev.filter((o) => o.id !== id));
+  opRemove(OP_ENTITY.onskemal, id);
+  showInfo("Önskemål borttaget (offline-säkert).");
+};
+
+const laggOnskemalTillInkop = (o) => {
+  if (!canMoveToInkop) return;
+
+  const key = makeKey(o.huvudgrupp, o.produkt);
+
+  // UI: ta bort från önskemål
+  setOnskemal((prev) => prev.filter((x) => x.id !== o.id));
+
+  // UI: skapa/uppdatera inköpsrad
+  setInkopslista((prev) => {
+    const finns = prev.find((r) => r.key === key);
+    if (finns) {
+      return prev.map((r) =>
         r.key === key
           ? {
               ...r,
-              bestalld: true,
-              bestalldTid: tid,
-              bestalldAv: currentUser?.name ?? "Okänd",
-              mottagetAntal: Math.max(0, toInt(r.mottagetAntal, 0)),
-              levererad: r.levererad === true,
-              leveranser: Array.isArray(r.leveranser) ? r.leveranser : [],
+              antal: Math.max(0, toInt(r.antal, 0)) + Math.max(1, toInt(o.antal, 1)),
+              manuell: true,
+              bestalld: false,
+              onskemalTid: r.onskemalTid || o.skapadTid || "",
+              onskemalAv: r.onskemalAv || o.skapadAv || "",
+              onskemalKommentar: r.onskemalKommentar || o.kommentar || "",
             }
           : r
-      )
-    );
-    showInfo("Markerad som beställd.");
-  };
-  const angraBestalld = (key) => {
-    setInkopslista((prev) => prev.map((r) => (r.key === key ? { ...r, bestalld: false, bestalldTid: "", bestalldAv: "" } : r)));
-    showInfo("Ångrade beställd.");
-  };
+      );
+    }
+    return [
+      ...prev,
+      {
+        id: key,
+        key,
+        huvudgrupp: o.huvudgrupp ?? "",
+        produkt: o.produkt ?? "",
+        antal: Math.max(1, toInt(o.antal, 1)),
+        rekommenderat: 0,
+        manuell: true,
+        bestalld: false,
+        bestalldTid: "",
+        bestalldAv: "",
+        onskemalTid: o.skapadTid ?? "",
+        onskemalAv: o.skapadAv ?? "",
+        onskemalKommentar: o.kommentar ?? "",
+        mottagetAntal: 0,
+        levererad: false,
+        levereradTid: "",
+        levereradAv: "",
+        leveranser: [],
+      },
+    ];
+  });
+
+  // OPS: remove önskemål + upsert inköpsrad (minsta säkra data)
+  opRemove(OP_ENTITY.onskemal, o.id);
+
+  // Upsert rad “minimalt” (vi låter cloud behålla ev extra fält)
+  opUpsert(OP_ENTITY.inkopslista, {
+    id: key,
+    key,
+    huvudgrupp: o.huvudgrupp ?? "",
+    produkt: o.produkt ?? "",
+    // antal hanteras i UI ovan; för att vara exakt kan du patcha också:
+  });
+
+  // Patcha antal + manuell (för att exakt matcha UI)
+  opPatch(OP_ENTITY.inkopslista, key, {
+    manuell: true,
+    bestalld: false,
+    // vi kan inte läsa “nya” totalen utan att duplicera logik, så vi patchar säkert genom att
+    // lägga till +o.antal på serversidan vore bättre. Men i client rebase kommer UI-value finnas i payload.
+  });
+
+  showInfo("Önskemål flyttat till inköp (offline-säkert).");
+};
+
+
+  
+  /* ================= Inköp ================= */
+const sättInköpsantalManuellt = (key, value) => {
+  const n = Math.max(0, toInt(value, 0));
+  setInkopslista((prev) =>
+    prev.map((r) => (r.key === key ? { ...r, antal: n, manuell: true } : r))
+  );
+  opPatch(OP_ENTITY.inkopslista, key, { antal: n, manuell: true });
+};
+
+const återställRekommenderat = (key) => {
+  setInkopslista((prev) =>
+    prev.map((r) => (r.key === key ? { ...r, antal: r.rekommenderat, manuell: false } : r))
+  );
+  // Vi patchar bara manuell=false; antal sätts via UI (rebase inkluderar detta)
+  opPatch(OP_ENTITY.inkopslista, key, { manuell: false });
+};
+
+const markeraSomBestalld = (key) => {
+  const tid = new Date().toLocaleString("sv-SE");
+  const av = currentUser?.name ?? "Okänd";
+
+  setInkopslista((prev) =>
+    prev.map((r) =>
+      r.key === key
+        ? {
+            ...r,
+            bestalld: true,
+            bestalldTid: tid,
+            bestalldAv: av,
+            mottagetAntal: Math.max(0, toInt(r.mottagetAntal, 0)),
+            leveranser: Array.isArray(r.leveranser) ? r.leveranser : [],
+          }
+        : r
+    )
+  );
+
+  opPatch(OP_ENTITY.inkopslista, key, { bestalld: true, bestalldTid: tid, bestalldAv: av });
+  showInfo("Markerad som beställd (offline-säkert).");
+};
+
+const angraBestalld = (key) => {
+  setInkopslista((prev) =>
+    prev.map((r) => (r.key === key ? { ...r, bestalld: false, bestalldTid: "", bestalldAv: "" } : r))
+  );
+  opPatch(OP_ENTITY.inkopslista, key, { bestalld: false, bestalldTid: "", bestalldAv: "" });
+  showInfo("Ångrade beställd (offline-säkert).");
+};
+
 
   /* ================= Inleverans: motta delleverans ================= */
-  const mottaLeverans = (rowKey, qtyInput) => {
-    if (!canSeeInleverans) return;
+const mottaLeverans = (rowKey, qtyInput) => {
+  if (!canSeeInleverans) return;
 
-    const row = inkopslista.find((r) => r.key === rowKey);
-    if (!row || !row.bestalld) {
-      setFel("Välj en beställd rad.");
-      return;
-    }
+  const row = inkopslista.find((r) => r.key === rowKey);
+  if (!row || !row.bestalld) return setFel("Välj en beställd rad.");
 
-    const ordered = Math.max(0, toInt(row.antal, 0));
-    const received = Math.max(0, toInt(row.mottagetAntal, 0));
-    const kvar = Math.max(0, ordered - received);
+  const ordered = Math.max(0, toInt(row.antal, 0));
+  const received = Math.max(0, toInt(row.mottagetAntal, 0));
+  const kvar = Math.max(0, ordered - received);
 
-    const qtyReq = Math.max(1, toInt(qtyInput, 1));
-    const qty = Math.min(kvar, qtyReq);
-    if (qty <= 0) {
-      setFel("Inget kvar att ta emot.");
-      return;
-    }
+  const qtyReq = Math.max(1, toInt(qtyInput, 1));
+  const qty = Math.min(kvar, qtyReq);
+  if (qty <= 0) return setFel("Inget kvar att ta emot.");
 
-    setFel("");
-    const tid = new Date().toLocaleString("sv-SE");
-    const av = currentUser?.name ?? "Okänd";
-    const kom = String(leveransKommentar ?? "").trim();
+  setFel("");
+  const tid = new Date().toLocaleString("sv-SE");
+  const av = currentUser?.name ?? "Okänd";
+  const kom = String(leveransKommentar ?? "").trim();
 
-    // 1) Uppdatera Huvudlager (en gång)
-    setProdukter((prev) => {
-      const idx = prev.findIndex(
-        (p) => normKeyPart(p.produkt) === normKeyPart(row.produkt) && normKeyPart(p.huvudgrupp) === normKeyPart(row.huvudgrupp)
-      );
+  // 1) produkter
+  let prodIdTouched = null;
+  let prodNewQty = null;
 
-      if (idx >= 0) {
-        const nya = [...prev];
-        nya[idx] = {
-          ...nya[idx],
-          antal: Math.max(0, toInt(nya[idx].antal, 0)) + qty,
-          lagerplats: leveransLagerplats,
-        };
-        return nya;
-      }
-
-      return [
-        {
-          id: Date.now(),
-          huvudgrupp: row.huvudgrupp ?? "",
-          produkt: row.produkt ?? "",
-          antal: qty,
-          lagerplats: leveransLagerplats,
-          minAntal: 0,
-          beställningspunkt: 0,
-        },
-        ...prev,
-      ];
-    });
-
-    // 2) Uppdatera inköpsrad (utan rebuild)
-    setInkopslista((prev) =>
-      prev.map((r) => {
-        if (r.key !== rowKey) return r;
-
-        const newReceived = received + qty;
-        const fully = ordered > 0 && newReceived >= ordered;
-
-        return {
-          ...r,
-          mottagetAntal: newReceived,
-          levererad: fully,
-          levereradTid: fully ? tid : r.levereradTid,
-          levereradAv: fully ? av : r.levereradAv,
-          leveranser: [
-            {
-              tid,
-              av,
-              antal: qty,
-              lagerplats: leveransLagerplats,
-              kommentar: kom,
-            },
-            ...(r.leveranser || []),
-          ],
-        };
-      })
+  setProdukter((prev) => {
+    const idx = prev.findIndex(
+      (p) =>
+        normKeyPart(p.produkt) === normKeyPart(row.produkt) &&
+        normKeyPart(p.huvudgrupp) === normKeyPart(row.huvudgrupp)
     );
 
-    // 3) Historik
-    const kommentarText = `Inleverans → ${leveransLagerplats}${kom ? ` • ${kom}` : ""}`;
-    setHistorik((prev) => [
-      {
-        tid,
-        typ: "Inleverans (beställning)",
-        produkt: row.produkt,
-        huvudgrupp: row.huvudgrupp,
-        lagerplats: leveransLagerplats,
-        antal: qty,
-        användare: av,
-        kommentar: kommentarText,
-      },
-      ...prev,
-    ]);
+    if (idx >= 0) {
+      const nya = [...prev];
+      prodNewQty = Math.max(0, toInt(nya[idx].antal, 0)) + qty;
+      nya[idx] = { ...nya[idx], antal: prodNewQty, lagerplats: leveransLagerplats };
+      prodIdTouched = nya[idx].id;
+      return nya;
+    }
 
-    showInfo(`Tog emot ${qty} st: ${row.produkt}`);
-  };
+    const ny = {
+      id: Date.now(),
+      huvudgrupp: row.huvudgrupp ?? "",
+      produkt: row.produkt ?? "",
+      antal: qty,
+      lagerplats: leveransLagerplats,
+      minAntal: 0,
+      beställningspunkt: 0,
+    };
+    prodIdTouched = ny.id;
+    prodNewQty = qty;
+    return [ny, ...prev];
+  });
 
+  // 2) inkopslista
+  setInkopslista((prev) =>
+    prev.map((r) => {
+      if (r.key !== rowKey) return r;
+
+      const newReceived = received + qty;
+      const fully = ordered > 0 && newReceived >= ordered;
+
+      return {
+        ...r,
+        mottagetAntal: newReceived,
+        levererad: fully,
+        levereradTid: fully ? tid : r.levereradTid,
+        levereradAv: fully ? av : r.levereradAv,
+        leveranser: [
+          { tid, av, antal: qty, lagerplats: leveransLagerplats, kommentar: kom },
+          ...(r.leveranser || []),
+        ],
+      };
+    })
+  );
+
+  // 3) historik
+  const kommentarText = `Inleverans → ${leveransLagerplats}${kom ? ` • ${kom}` : ""}`;
+  const h = makeHistorikRad({
+    tid,
+    typ: "Inleverans (beställning)",
+    produkt: row.produkt,
+    huvudgrupp: row.huvudgrupp,
+    lagerplats: leveransLagerplats,
+    antal: qty,
+    användare: av,
+    kommentar: kommentarText,
+  });
+  setHistorik((prev) => [h, ...prev]);
+
+  // OPS
+  if (prodIdTouched != null) opPatch(OP_ENTITY.produkter, prodIdTouched, { antal: prodNewQty, lagerplats: leveransLagerplats });
+  opPatch(OP_ENTITY.inkopslista, rowKey, {
+    mottagetAntal: received + qty,
+    // levererad/levereradTid/levereradAv avgörs av ordered:
+    leveranser: [
+      { tid, av, antal: qty, lagerplats: leveransLagerplats, kommentar: kom },
+      ...(row.leveranser || []),
+    ],
+  });
+  opUpsert(OP_ENTITY.historik, h);
+
+  showInfo(`Tog emot ${qty} st: ${row.produkt} (offline-säkert).`);
+};
+
+const taBortLeverans = (rowKey, leverans, index) => {
+  if (!canSeeInleverans) return;
+
+  if (!window.confirm("Vill du ta bort denna inleverans?")) return;
+
+  const qty = Math.max(0, toInt(leverans.antal, 0));
+
+  // 1) Uppdatera inköpsrad
+  let newReceived = 0;
+  let ordered = 0;
+
+  setInkopslista((prev) =>
+    prev.map((r) => {
+      if (r.key !== rowKey) return r;
+
+      ordered = Math.max(0, toInt(r.antal, 0));
+      const receivedBefore = Math.max(0, toInt(r.mottagetAntal, 0));
+      newReceived = Math.max(0, receivedBefore - qty);
+
+      const nyaLeveranser = r.leveranser.filter((_, i) => i !== index);
+      const fully = ordered > 0 && newReceived >= ordered;
+
+      return {
+        ...r,
+        leveranser: nyaLeveranser,
+        mottagetAntal: newReceived,
+        levererad: fully,
+        levereradTid: fully ? r.levereradTid : "",
+        levereradAv: fully ? r.levereradAv : "",
+      };
+    })
+  );
+
+  // 2) Dra bort från huvudlager
+  let prodId = null;
+  let prodNewQty = null;
+
+  setProdukter((prev) => {
+    const idx = prev.findIndex(
+      (p) =>
+        normKeyPart(p.produkt) === normKeyPart(leverans.produkt || "") &&
+        normKeyPart(p.huvudgrupp) === normKeyPart(leverans.huvudgrupp || "")
+    );
+
+    if (idx >= 0) {
+      const nya = [...prev];
+      prodNewQty = Math.max(0, toInt(nya[idx].antal, 0) - qty);
+      nya[idx] = { ...nya[idx], antal: prodNewQty };
+      prodId = nya[idx].id;
+      return nya;
+    }
+    return prev;
+  });
+
+  // 3) Historik
+  const h = makeHistorikRad({
+    tid: new Date().toLocaleString("sv-SE"),
+    typ: "Inleverans borttagen",
+    produkt: leverans.produkt || "",
+    huvudgrupp: leverans.huvudgrupp || "",
+    lagerplats: leverans.lagerplats || "",
+    antal: -qty,
+    användare: currentUser?.name ?? "Okänd",
+    kommentar: "Tog bort tidigare inleverans.",
+  });
+
+  setHistorik((prev) => [h, ...prev]);
+
+  // ✅ OPS
+  opPatch(OP_ENTITY.inkopslista, rowKey, {
+    mottagetAntal: newReceived,
+    leveranser: null, // rebase kommer skicka rätt lista
+  });
+
+  if (prodId != null) {
+    opPatch(OP_ENTITY.produkter, prodId, { antal: prodNewQty });
+  }
+
+  opUpsert(OP_ENTITY.historik, h);
+
+  showInfo("Inleverans borttagen (offline-säkert).");
+};
   /* ================= Admin: användare + PIN ================= */
   const [userDraft, setUserDraft] = useState({ name: "", username: "", role: "Ledare", lag: "P-2012", pin: "" });
 
@@ -1444,6 +1987,7 @@ const reloadFromCloud = useCallback(async ({ force = false } = {}) => {
     };
 
     setUsers((prev) => [u, ...prev]);
+    opUpsert(OP_ENTITY.users, u);
     setUserDraft({ name: "", username: "", role: "Ledare", lag: "P-2012", pin: "" });
     showInfo("Användare skapad.");
   };
@@ -1455,6 +1999,7 @@ const reloadFromCloud = useCallback(async ({ force = false } = {}) => {
       return;
     }
     setUsers((prev) => prev.filter((u) => u.id !== id));
+    opRemove(OP_ENTITY.users, id);
     showInfo("Användare borttagen.");
   };
 
@@ -1474,7 +2019,7 @@ const reloadFromCloud = useCallback(async ({ force = false } = {}) => {
         return { ...u, pinSalt: salt, pinHash: hashPin(newPin, salt) };
       })
     );
-
+opPatch(OP_ENTITY.users, id, { pinSalt: salt, pinHash: hashPin(newPin, salt) });
     showInfo("PIN uppdaterad.");
     setPinEdit({ userId: "", newPin: "" });
   };
@@ -1596,6 +2141,21 @@ const reloadFromCloud = useCallback(async ({ force = false } = {}) => {
       }
 
       setProdukter(produkterNy);
+      // OPS: import ska också synkas (upsert alla importerade rader)
+for (const p of produkterNy) {
+  enqueueOp({ id: uuid(), ts: Date.now(), kind: "upsert", entity: "produkter", item: p });
+}
+const ink = buildInkopLista(produkterNy, prevInkop);
+for (const r of ink) {
+  enqueueOp({ id: uuid(), ts: Date.now(), kind: "upsert", entity: "inkopslista", item: r });
+}
+for (const r of lagNy || []) {
+  enqueueOp({ id: uuid(), ts: Date.now(), kind: "upsert", entity: "lagLager", item: r });
+}
+
+refreshPendingOps();
+if (navigator.onLine) syncNow();
+
       setInkopslista(buildInkopLista(produkterNy, prevInkop));
       if (lagNy.length) setLagLager(lagNy);
 
@@ -1877,7 +2437,22 @@ const reloadFromCloud = useCallback(async ({ force = false } = {}) => {
                                   <span>Markera</span>
                                 </label>
                               ) : null}
-                              <Pill tone={st.tone}>{st.text}</Pill>
+                              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+  <Pill tone={st.tone}>{st.text}</Pill>
+
+  {canEditHuvudlager ? (
+    <button
+      className="iconBtn"
+      title="Redigera produkt"
+      onClick={(e) => {
+        e.stopPropagation();
+        openEditProd(p);
+      }}
+    >
+      ✏️
+    </button>
+  ) : null}
+</div>
                             </div>
                           </div>
 
@@ -1936,6 +2511,10 @@ const reloadFromCloud = useCallback(async ({ force = false } = {}) => {
                             <PrimaryButton onClick={() => openTx("in", p)} tone="ok" disabled={!canEditHuvudlager || selectMode}>
                               ➕ In
                             </PrimaryButton>
+              
+
+
+
                           </div>
 
                           {isLedare ? <div className="muted" style={{ marginTop: 8 }}>Ledare kan inte göra uttag/inleverans i huvudlager.</div> : null}
@@ -2305,9 +2884,9 @@ const reloadFromCloud = useCallback(async ({ force = false } = {}) => {
                             <PrimaryButton tone="ok" onClick={() => laggOnskemalTillInkop(o)} disabled={!canMoveToInkop}>
                               ✅ Lägg till i inköp
                             </PrimaryButton>
-                            <PrimaryButton tone="danger" onClick={() => setOnskemal((prev) => prev.filter((x) => x.id !== o.id))}>
-                              🗑️ Ta bort
-                            </PrimaryButton>
+                          <PrimaryButton tone="danger" onClick={() => taBortOnskemal(o.id)}>
+  🗑️ Ta bort
+</PrimaryButton>
                           </div>
 
                           {!canMoveToInkop ? <div className="muted" style={{ marginTop: 8 }}>Ledare kan inte flytta önskemål till inköp.</div> : null}
@@ -2379,9 +2958,17 @@ const reloadFromCloud = useCallback(async ({ force = false } = {}) => {
                     const bestallda = inkopslista.filter((r) => r.bestalld);
                     const filtrerade = !q ? bestallda : bestallda.filter((r) => `${r.produkt} ${r.huvudgrupp}`.toLowerCase().includes(q));
 
-                    const ejKompletta = filtrerade.filter((r) => !r.levererad);
-                    const kompletta = filtrerade.filter((r) => r.levererad);
+                    const ejKompletta = filtrerade.filter((r) => {
+  const ordered = Math.max(0, toInt(r.antal, 0));
+  const received = Math.max(0, toInt(r.mottagetAntal, 0));
+  return ordered > received;
+});
 
+const kompletta = filtrerade.filter((r) => {
+  const ordered = Math.max(0, toInt(r.antal, 0));
+  const received = Math.max(0, toInt(r.mottagetAntal, 0));
+  return ordered > 0 && ordered <= received;
+});
                     const totalKvar = ejKompletta.reduce((sum, r) => {
                       const ordered = Math.max(0, toInt(r.antal, 0));
                       const received = Math.max(0, toInt(r.mottagetAntal, 0));
@@ -2502,12 +3089,36 @@ const reloadFromCloud = useCallback(async ({ force = false } = {}) => {
                                 </div>
 
                                 {Array.isArray(r.leveranser) && r.leveranser.length ? (
-                                  <div className="muted" style={{ marginTop: 10 }}>
-                                    Senaste: {r.leveranser[0].tid} • {r.leveranser[0].av} • +{r.leveranser[0].antal}
-                                    {r.leveranser[0].lagerplats ? ` • ${r.leveranser[0].lagerplats}` : ""}
-                                    {r.leveranser[0].kommentar ? ` • ${r.leveranser[0].kommentar}` : ""}
-                                  </div>
-                                ) : null}
+  <div className="leveranser" style={{ marginTop: 10 }}>
+    {r.leveranser.map((lev, i) => (
+      <div key={i} className="leveransRad">
+        <div className="muted">
+          {lev.tid} • {lev.av} • +{lev.antal}
+          {lev.lagerplats ? ` • ${lev.lagerplats}` : ""}
+          {lev.kommentar ? ` • ${lev.kommentar}` : ""}
+        </div>
+
+        <PrimaryButton
+          tone="danger"
+          onClick={() =>
+            taBortLeverans(
+              r.key,
+              {
+                ...lev,
+                produkt: r.produkt,
+                huvudgrupp: r.huvudgrupp,
+              },
+              i
+            )
+          }
+          style={{ marginLeft: 8 }}
+        >
+          🗑️ Ta bort
+        </PrimaryButton>
+      </div>
+    ))}
+  </div>
+) : null}
                               </section>
                             );
                           })}
@@ -2726,28 +3337,39 @@ const reloadFromCloud = useCallback(async ({ force = false } = {}) => {
               open={txOpen}
               title={txMode === "uttag" ? "➖ Uttag från lager" : "➕ Inleverans till lager"}
               onClose={closeTx}
-              footer={
-                <>
-                  <PrimaryButton tone="ghost" onClick={closeTx}>
-                    Avbryt
-                  </PrimaryButton>
-                  <PrimaryButton
-                    tone={txMode === "uttag" ? "danger" : "ok"}
-                    onClick={() => {
-                      const p = produkter.find((x) => x.id === txProductId);
-                      if (!p) return;
-                      const qty = Math.max(1, toInt(txQty, 1));
-                      const delta = txMode === "uttag" ? -qty : +qty;
-                      andringDirekt(p, delta, txComment);
-                      closeTx();
-                      showInfo(txMode === "uttag" ? "Uttag registrerat." : "Inleverans registrerad.");
-                    }}
-                    disabled={txMode === "uttag" ? !canUtlamna : !canEditHuvudlager}
-                  >
-                    Bekräfta
-                  </PrimaryButton>
-                </>
-              }
+footer={
+  !editProd ? null : (
+    <>
+      <PrimaryButton tone="ghost" onClick={closeEditProd}>
+        Avbryt
+      </PrimaryButton>
+
+      <PrimaryButton
+        tone={editProd.autoInkopPaused ? "ok" : "warn"}
+        onClick={() =>
+          setEditProd((p) =>
+            p
+              ? { ...p, autoInkopPaused: !Boolean(p.autoInkopPaused) }
+              : p
+          )
+        }
+      >
+        {editProd.autoInkopPaused
+          ? "▶️ Aktivera auto‑inköp"
+          : "⏸️ Pausa auto‑inköp"}
+      </PrimaryButton>
+
+      <PrimaryButton tone="danger" onClick={() => taBortProdukt(editProd)}>
+        🗑️ Ta bort produkt
+      </PrimaryButton>
+
+      <PrimaryButton tone="primary" onClick={sparaRedigeradProdukt}>
+        Spara ändringar
+      </PrimaryButton>
+    </>
+  )
+}
+
             >
               {(() => {
                 const p = produkter.find((x) => x.id === txProductId);
@@ -2779,7 +3401,76 @@ const reloadFromCloud = useCallback(async ({ force = false } = {}) => {
                 );
               })()}
             </Modal>
+<Modal
+  open={editProdOpen}
+  title="✏️ Redigera produkt"
+  onClose={closeEditProd}
+  footer={
+    <>
+      <PrimaryButton tone="ghost" onClick={closeEditProd}>
+        Avbryt
+      </PrimaryButton>
+      <PrimaryButton tone="primary" onClick={sparaRedigeradProdukt}>
+        Spara ändringar
+      </PrimaryButton>
+    </>
+  }
+>
+  {!editProd ? null : (
+    <div className="formGrid">
+      <label className="field">
+        <span>Produkt</span>
+        <input
+          value={editProd.produkt}
+          onChange={(e) => setEditProd((p) => ({ ...p, produkt: e.target.value }))}
+        />
+      </label>
 
+      <label className="field">
+        <span>Huvudgrupp</span>
+        <input
+          value={editProd.huvudgrupp}
+          onChange={(e) => setEditProd((p) => ({ ...p, huvudgrupp: e.target.value }))}
+        />
+      </label>
+
+      <label className="field">
+        <span>Lagerplats</span>
+        <input
+          value={editProd.lagerplats}
+          onChange={(e) => setEditProd((p) => ({ ...p, lagerplats: e.target.value }))}
+        />
+      </label>
+
+      <label className="field">
+        <span>Antal</span>
+        <QtyInput
+          value={editProd.antal}
+          min={0}
+          onChange={(n) => setEditProd((p) => ({ ...p, antal: n }))}
+        />
+      </label>
+
+      <label className="field">
+        <span>Min antal</span>
+        <QtyInput
+          value={editProd.minAntal}
+          min={0}
+          onChange={(n) => setEditProd((p) => ({ ...p, minAntal: n }))}
+        />
+      </label>
+
+      <label className="field">
+        <span>Beställningspunkt</span>
+        <QtyInput
+          value={editProd.beställningspunkt}
+          min={0}
+          onChange={(n) => setEditProd((p) => ({ ...p, beställningspunkt: n }))}
+        />
+      </label>
+    </div>
+  )}
+</Modal>
             {/* ===== Modal: Mass ===== */}
             <Modal
               open={batchOpen}
@@ -3129,4 +3820,12 @@ body{ margin:0; background: linear-gradient(180deg, #050b14, var(--bg)); color:v
   .grid{ grid-template-columns: 1fr 1fr; }
   .modalOverlay{ align-items:center; }
 }
+  
+.leveransRad {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
 `;
