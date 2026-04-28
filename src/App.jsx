@@ -519,6 +519,28 @@ const [produkter, setProdukter] = useState(
     return buildInkopLista(Array.isArray(saved?.produkter) ? saved.produkter : [], []);
   });
 
+const [manuellInkopOpen, setManuellInkopOpen] = useState(false);
+const [manuellInkopProd, setManuellInkopProd] = useState(null);
+const [manuellInkopQty, setManuellInkopQty] = useState(1);
+
+const openManuellInkop = (p) => {
+  setManuellInkopProd(p);
+  setManuellInkopQty(1);
+  setManuellInkopOpen(true);
+};
+const closeManuellInkop = () => {
+  setManuellInkopOpen(false);
+  setManuellInkopProd(null);
+};
+
+const inkopStatusForProdukt = (p) => {
+  const key = makeKey(p.huvudgrupp, p.produkt);
+  const r = inkopslista.find((x) => x.key === key);
+  if (!r) return null;
+  if (r.bestalld) return "beställd";
+  return "inköp";
+};
+
   const [onskemal, setOnskemal] = useState(Array.isArray(saved?.onskemal) ? saved.onskemal : []);
   const [historik, setHistorik] = useState(Array.isArray(saved?.historik) ? saved.historik : []);
 
@@ -2378,6 +2400,14 @@ if (navigator.onLine) syncNow();
                         <PrimaryButton tone="ok" onClick={() => openBatch("in")} disabled={selectedCount === 0}>
                           ➕ In
                         </PrimaryButton>
+                        
+<PrimaryButton
+  tone="ghost"
+  onClick={() => openManuellInkop(p)}
+>
+  📦 Manuellt inköp
+</PrimaryButton>
+
                       </div>
                     </div>
                   ) : null}
@@ -2426,8 +2456,23 @@ if (navigator.onLine) syncNow();
                                   <span>Markera</span>
                                 </label>
                               ) : null}
-                              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                              <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
   <Pill tone={st.tone}>{st.text}</Pill>
+
+  {(() => {
+    const key = makeKey(p.huvudgrupp, p.produkt);
+    const r = inkopslista.find((x) => x.key === key);
+    if (!r) return null;
+
+    const antal = Math.max(0, toInt(r.antal, 0));
+    if (antal <= 0) return null;
+
+    return (
+      <Pill tone={r.bestalld ? "ok" : "warn"}>
+        +{antal} st
+      </Pill>
+    );
+  })()}
 
   {canEditHuvudlager ? (
     <button
@@ -3386,6 +3431,106 @@ const kompletta = filtrerade.filter((r) => {
                 );
               })()}
             </Modal>
+
+<Modal
+  open={manuellInkopOpen}
+  title="📦 Manuellt inköp"
+  onClose={closeManuellInkop}
+  footer={
+    !manuellInkopProd ? null : (
+      <>
+        <PrimaryButton tone="ghost" onClick={closeManuellInkop}>
+          Avbryt
+        </PrimaryButton>
+        <PrimaryButton
+          tone="primary"
+          onClick={() => {
+            const p = manuellInkopProd;
+            const qty = Math.max(1, toInt(manuellInkopQty, 1));
+            const key = makeKey(p.huvudgrupp, p.produkt);
+
+            setInkopslista((prev) => {
+              const existing = prev.find((r) => r.key === key);
+              if (existing) {
+                return prev.map((r) =>
+                  r.key === key
+                    ? {
+                        ...r,
+                        antal: Math.max(0, toInt(r.antal, 0)) + qty,
+                        manuell: true,
+                        bestalld: false,
+                      }
+                    : r
+                );
+              }
+              return [
+                ...prev,
+                {
+                  id: key,
+                  key,
+                  huvudgrupp: p.huvudgrupp ?? "",
+                  produkt: p.produkt ?? "",
+                  antal: qty,
+                  rekommenderat: 0,
+                  manuell: true,
+                  bestalld: false,
+                  mottagetAntal: 0,
+                  levererad: false,
+                  leveranser: [],
+                },
+              ];
+            });
+
+            // Historik
+            const h = makeHistorikRad({
+              tid: new Date().toLocaleString("sv-SE"),
+              typ: "Manuellt inköp",
+              produkt: p.produkt,
+              huvudgrupp: p.huvudgrupp,
+              lagerplats: p.lagerplats,
+              antal: qty,
+              användare: currentUser?.name ?? "Okänd",
+              kommentar: "Manuellt beställd från lagerkort.",
+            });
+            setHistorik((prev) => [h, ...prev]);
+
+            // OPS
+            opUpsert(OP_ENTITY.inkopslista, {
+              id: key,
+              key,
+              huvudgrupp: p.huvudgrupp ?? "",
+              produkt: p.produkt ?? "",
+              antal: qty,
+              manuell: true,
+              bestalld: false,
+            });
+            opUpsert(OP_ENTITY.historik, h);
+
+            showInfo("Manuellt inköp lagt till.");
+            closeManuellInkop();
+          }}
+        >
+          Lägg till inköp
+        </PrimaryButton>
+      </>
+    )
+  }
+>
+  {!manuellInkopProd ? null : (
+    <div className="formGrid">
+      <div><strong>{manuellInkopProd.produkt}</strong></div>
+      <label className="field">
+        <span>Antal</span>
+        <QtyInput
+          value={manuellInkopQty}
+          min={1}
+          onChange={setManuellInkopQty}
+        />
+      </label>
+    </div>
+  )}
+</Modal>
+
 <Modal
   open={editProdOpen}
   title="✏️ Redigera produkt"
