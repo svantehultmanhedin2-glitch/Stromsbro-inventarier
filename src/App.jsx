@@ -3319,44 +3319,43 @@ const kompletta = filtrerade.filter((r) => {
             </main>
 
             {/* ===== Modal: Enstaka uttag/in ===== */}
-            <Modal
-              open={txOpen}
-              title={txMode === "uttag" ? "➖ Uttag från lager" : "➕ Inleverans till lager"}
-              onClose={closeTx}
-footer={
-  !editProd ? null : (
+
+<Modal
+  open={txOpen}
+  title={txMode === "uttag"
+    ? "➖ Uttag från lager"
+    : "➕ Inleverans till lager"}
+  onClose={closeTx}
+  footer={
     <>
-      <PrimaryButton tone="ghost" onClick={closeEditProd}>
+      <PrimaryButton tone="ghost" onClick={closeTx}>
         Avbryt
       </PrimaryButton>
 
       <PrimaryButton
-        tone={editProd.autoInkopPaused ? "ok" : "warn"}
-        onClick={() =>
-          setEditProd((p) =>
-            p
-              ? { ...p, autoInkopPaused: !Boolean(p.autoInkopPaused) }
-              : p
-          )
-        }
+        tone={txMode === "uttag" ? "danger" : "ok"}
+        onClick={() => {
+          const p = produkter.find((x) => x.id === txProductId);
+          if (!p) return;
+
+          const qty = Math.max(1, toInt(txQty, 1));
+          const delta = txMode === "uttag" ? -qty : +qty;
+
+          andringDirekt(p, delta, txComment);
+          closeTx();
+          showInfo(
+            txMode === "uttag"
+              ? "Uttag registrerat."
+              : "Inleverans registrerad."
+          );
+        }}
       >
-        {editProd.autoInkopPaused
-          ? "▶️ Aktivera auto‑inköp"
-          : "⏸️ Pausa auto‑inköp"}
-      </PrimaryButton>
-
-      <PrimaryButton tone="danger" onClick={() => taBortProdukt(editProd)}>
-        🗑️ Ta bort produkt
-      </PrimaryButton>
-
-      <PrimaryButton tone="primary" onClick={sparaRedigeradProdukt}>
-        Spara ändringar
+        Bekräfta
       </PrimaryButton>
     </>
-  )
-}
+  }
+>
 
-            >
               {(() => {
                 const p = produkter.find((x) => x.id === txProductId);
                 if (!p) return <div className="empty">Ingen produkt vald.</div>;
