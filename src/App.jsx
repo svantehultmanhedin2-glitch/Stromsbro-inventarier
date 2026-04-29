@@ -220,7 +220,70 @@ function downloadXlsx(workbook, filename) {
   a.remove();
   URL.revokeObjectURL(url);
 }
+function stableLagLagerId(lag, huvudgrupp, produkt) {
+  const l = String(lag || "Okänt").trim() || "Okänt";
+  return `${l}::${normKeyPart(huvudgrupp)}::${normKeyPart(produkt)}`;
+}
 
+function migrateLagLagerRows(rows) {
+  const byNewId = new Map(); // newId -> { row, sourceIds: [] }
+  const removes = new Set();
+
+  for (const r of (rows || [])) {
+    const lag = (r?.lag || "Okänt").trim() || "Okänt";
+    const hg = r?.huvudgrupp ?? "";
+    const prod = r?.produkt ?? "";
+
+    const newId = stableLagLagerId(lag, hg, prod);
+    const oldId = String(r?.id ?? "");
+
+    // markera gamla id för borttag om de skiljer
+    if (oldId && oldId !== newId) removes.add(oldId);
+
+    const antal = Math.max(0, toInt(r?.antal, 0));
+
+    if (!byNewId.has(newId)) {
+      byNewId.set(newId, {
+        row: {
+          ...r,
+          id: newId,
+          lag,
+          huvudgrupp: hg,
+          produkt: prod,
+          antal,
+        },
+        sourceIds: oldId ? [oldId] : [],
+      });
+    } else {
+      const entry = byNewId.get(newId);
+      // slå ihop: summera antal
+      entry.row.antal = Math.max(0, toInt(entry.row.antal, 0)) + antal;
+
+      // behåll “bästa” metadata
+      if (!entry.row.utlamningsdatum && r?.utlamningsdatum) entry.row.utlamningsdatum = r.utlamningsdatum;
+      if (!entry.row.kommentar && r?.kommentar) entry.row.kommentar = r.kommentar;
+      if (!entry.row.skapadTid && r?.skapadTid) entry.row.skapadTid = r.skapadTid;
+      if (!entry.row.skapadAv && r?.skapadAv) entry.row.skapadAv = r.skapadAv;
+
+      if (oldId) entry.sourceIds.push(oldId);
+    }
+  }
+
+  const nextRows = Array.from(byNewId.values()).map((x) => x.row);
+
+  // Om flera olika gamla rader mappade till samma stable id -> markera dem också för remove
+  for (const v of byNewId.values()) {
+    for (const sid of v.sourceIds) {
+      if (sid && sid !== v.row.id) removes.add(sid);
+    }
+  }
+
+  return {
+    nextRows,
+    removeIds: Array.from(removes),
+    upserts: nextRows, // vi upsertar hela nya listan (idempotent)
+  };
+}
 /* ================= PIN hashing (local-only) =================
    OBS: inte kryptografiskt starkt (offline/local). Bra nog för PIN i localStorage.
 */
@@ -564,6 +627,40 @@ const applySharedFromPayload = useCallback((p) => {
   if (Array.isArray(p?.historik)) setHistorik(p.historik);
   if (Array.isArray(p?.lagLager)) setLagLager(p.lagLager);
 }, [setUsers, setProdukter, setInkopslista, setOnskemal, setHistorik, setLagLager]);
+
+const lagLagerMigratedRef = useRef(false);
+
+useEffect(() => {
+  if (lagLagerMigratedRef.current) return;
+  if (!Array.isArray(lagLager) || lagLager.length === 0) return;
+
+  const { nextRows, removeIds, upserts } = migrateLagLagerRows(lagLager);
+
+  // kolla om något faktiskt ändrades
+  const changed =
+    removeIds.length > 0 ||
+    nextRows.length !== lagLager.length ||
+    nextRows.some((r, i) => String(r.id) !== String(lagLager[i]?.id));
+
+  if (!changed) {
+    lagLagerMigratedRef.current = true;
+    return;
+  }
+
+  // 1) UI
+  setLagLager(nextRows);
+
+  // 2) OPS: ta bort gamla id + upserta nya rader
+  for (const oldId of removeIds) {
+    opRemove(OP_ENTITY.lagLager, oldId);
+  }
+  for (const row of upserts) {
+    opUpsert(OP_ENTITY.lagLager, row);
+  }
+
+  showInfo("Migrerade lagmaterial till stabila ID:n.");
+  lagLagerMigratedRef.current = true;
+}, [lagLager, setLagLager, opRemove, opUpsert, showInfo]);
 
 // ===== Cloud sync refs (konfliktsäkert + ingen loop) =====
   const cloudHydratedRef = useRef(false);        // true efter första lyckade (eller misslyckade) load-försök
@@ -1549,17 +1646,55 @@ const taBortLagRad = (id) => {
     setReturQty(1);
   };
 
+const lagRadId = (rad) =>
+  String(
+    rad?.id ??
+      `${rad?.lag || "Okänt"}::${normKeyPart(rad?.huvudgrupp)}::${normKeyPart(rad?.produkt)}`
+  );
+
 const returTillHuvudlager = (rad, antalInput) => {
   if (!canUtlamna) return;
 
   const antal = Math.max(1, toInt(antalInput, 1));
-  if (antal > (rad.antal ?? 0)) return setFel("Kan inte returnera fler än lagets antal.");
+  const radAntal = Math.max(0, toInt(rad?.antal, 0));
+  if (antal > radAntal) return setFel("Kan inte returnera fler än lagets antal.");
   setFel("");
 
-  // 1) huvudlager: öka / skapa
-  let patchedProdId = null;
-  let patchedProdAntal = null;
+  const rowId = lagRadId(rad);
+  const nyLagQty = Math.max(0, radAntal - antal);
 
+  // 1) Huvudlager: öka (eller skapa ny) — vi bestämmer id NU så OPS kan använda det
+  const matchIdx = produkter.findIndex(
+    (p) =>
+      normKeyPart(p.produkt) === normKeyPart(rad.produkt) &&
+      normKeyPart(p.huvudgrupp) === normKeyPart(rad.huvudgrupp)
+  );
+
+  let prodId;
+  let prodNewQty;
+  let prodPatchObj = null;
+
+  if (matchIdx >= 0) {
+    const existing = produkter[matchIdx];
+    prodId = existing.id;
+    prodNewQty = Math.max(0, toInt(existing.antal, 0) + antal);
+    prodPatchObj = { ...existing, antal: prodNewQty };
+  } else {
+    // Skapa ny produkt i huvudlager om den saknas
+    prodId = Date.now();
+    prodNewQty = antal;
+    prodPatchObj = {
+      id: prodId,
+      huvudgrupp: rad.huvudgrupp ?? "",
+      produkt: rad.produkt ?? "",
+      antal: prodNewQty,
+      lagerplats: "Huvudförråd",
+      beställningspunkt: 0,
+      autoInkopPaused: false,
+    };
+  }
+
+  // UI: produkter
   setProdukter((prev) => {
     const idx = prev.findIndex(
       (p) =>
@@ -1569,56 +1704,48 @@ const returTillHuvudlager = (rad, antalInput) => {
 
     if (idx >= 0) {
       const nya = [...prev];
-      const newQty = Math.max(0, toInt(nya[idx].antal, 0)) + antal;
-      nya[idx] = { ...nya[idx], antal: newQty };
-      patchedProdId = nya[idx].id;
-      patchedProdAntal = newQty;
-      // inköp UI
+      nya[idx] = { ...nya[idx], antal: Math.max(0, toInt(nya[idx].antal, 0) + antal) };
+      // rebuild inköp baserat på nya listan
       setInkopslista((inkPrev) => buildInkopLista(nya, inkPrev));
       return nya;
     }
 
-    const ny = {
-      id: Date.now(),
-      huvudgrupp: rad.huvudgrupp ?? "",
-      produkt: rad.produkt ?? "",
-      antal,
-      lagerplats: "Huvudförråd",
-      beställningspunkt: 0,
-    };
-    patchedProdId = ny.id;
-    patchedProdAntal = antal;
-    const nya = [ny, ...prev];
+    const nya = [prodPatchObj, ...prev];
     setInkopslista((inkPrev) => buildInkopLista(nya, inkPrev));
     return nya;
   });
 
-  // 2) laglager: minska / remove om 0
-  setLagLager((prev) => {
-    const kvar = prev.map((r) =>
-      r.id === rad.id ? { ...r, antal: Math.max(0, toInt(r.antal, 0) - antal) } : r
-    );
-    const filtered = kvar.filter((r) => toInt(r.antal, 0) > 0);
-    return filtered;
-  });
+  // 2) Laglager: minska / remove om 0 (använd samma id-logik)
+  setLagLager((prev) =>
+    prev
+      .map((r) =>
+        String(r.id) === rowId ? { ...r, id: rowId, antal: nyLagQty } : r
+      )
+      .filter((r) => toInt(r.antal, 0) > 0)
+  );
 
-  // 3) historik
+  // 3) Historik
   const h = makeHistorikRad({
     tid: new Date().toLocaleString("sv-SE"),
     typ: "Retur från lag",
     produkt: rad.produkt,
     huvudgrupp: rad.huvudgrupp,
-    lagerplats: "",
+    lagerplats: "Huvudförråd",
     antal: +antal,
     användare: currentUser?.name ?? "Okänd",
     kommentar: `Från ${rad.lag || "Okänt"}`,
   });
   setHistorik((prev) => [h, ...prev]);
 
-  // OPS
-  if (patchedProdId != null) opPatch(OP_ENTITY.produkter, patchedProdId, { antal: patchedProdAntal });
-  opPatch(OP_ENTITY.lagLager, rad.id, { antal: Math.max(0, toInt(rad.antal, 0) - antal) });
-  if (Math.max(0, toInt(rad.antal, 0) - antal) <= 0) opRemove(OP_ENTITY.lagLager, rad.id);
+  // ✅ OPS (inga async-variabler)
+  opUpsert(OP_ENTITY.produkter, { ...prodPatchObj, id: prodId, antal: prodNewQty });
+
+  if (nyLagQty <= 0) {
+    opRemove(OP_ENTITY.lagLager, rowId);
+  } else {
+    opPatch(OP_ENTITY.lagLager, rowId, { antal: nyLagQty });
+  }
+
   opUpsert(OP_ENTITY.historik, h);
 
   showInfo(`Returnerade ${antal} st till huvudlager (offline-säkert).`);
@@ -2630,9 +2757,11 @@ if (navigator.onLine) syncNow();
                           </div>
 
                           <div className="btnRow" style={{ marginTop: 10 }}>
-                            <PrimaryButton tone="ok" onClick={() => openRetur(r)} disabled={!canUtlamna}>
-                              ↩ Retur
-                            </PrimaryButton>
+
+<PrimaryButton tone="ghost" onClick={() => openRetur(r)} disabled={!canUtlamna}>
+  ↩ Retur
+</PrimaryButton>
+
                             <PrimaryButton tone="danger" onClick={() => taBortLagRad(r.id)} disabled={isLedare}>
                               🗑️ Ta bort
                             </PrimaryButton>
@@ -3638,51 +3767,63 @@ const kompletta = filtrerade.filter((r) => {
 
             {/* ===== Modal: Retur ===== */}
             <Modal
-              open={returOpen}
-              title="↩ Retur till huvudlager"
-              onClose={closeRetur}
-              footer={
-                <>
-                  <PrimaryButton tone="ghost" onClick={closeRetur}>
-                    Avbryt
-                  </PrimaryButton>
-                  <PrimaryButton
-                    tone="ok"
-                    onClick={() => {
-                      if (!returRad) return;
-                      returTillHuvudlager(returRad, returQty);
-                      closeRetur();
-                    }}
-                    disabled={!canUtlamna}
-                  >
-                    Bekräfta retur
-                  </PrimaryButton>
-                </>
-              }
-            >
-              {!returRad ? (
-                <div className="empty">Ingen rad vald.</div>
-              ) : (
-                <div className="formGrid">
-                  <div style={{ display: "grid", gap: 6 }}>
-                    <div style={{ fontWeight: 950, fontSize: 16 }}>{returRad.produkt}</div>
-                    <div style={{ color: "var(--muted)", fontSize: 12 }}>
-                      Lag: <strong>{returRad.lag || "Okänt"}</strong> • Tillgängligt: <strong>{toInt(returRad.antal, 0)}</strong> st
-                    </div>
-                  </div>
+  open={returOpen}
+  title="↩ Retur till huvudlager"
+  onClose={closeRetur}
+  footer={
+    !returRad ? null : (
+      <>
+        <PrimaryButton tone="ghost" onClick={closeRetur}>
+          Avbryt
+        </PrimaryButton>
+        <PrimaryButton
+          tone="ok"
+          onClick={() => {
+            returTillHuvudlager(returRad, returQty);
+            closeRetur();
+          }}
+          disabled={!canUtlamna || returQty < 1}
+        >
+          Bekräfta retur
+        </PrimaryButton>
+      </>
+    )
+  }
+>
+  {!returRad ? (
+    <div className="empty">Ingen rad vald.</div>
+  ) : (
+    <div className="formGrid">
+      <div style={{ display: "grid", gap: 6 }}>
+        <div style={{ fontWeight: 950, fontSize: 16 }}>
+          {returRad.produkt}
+        </div>
+        <div style={{ color: "var(--muted)", fontSize: 12 }}>
+          Lag: <strong>{returRad.lag || "Okänt"}</strong> • Tillgängligt:{" "}
+          <strong>{toInt(returRad.antal, 0)}</strong> st
+        </div>
+      </div>
 
-                  <label className="field">
-                    <span>Antal att returnera</span>
-<QtyInput
-  value={returQty}
-  min={1}
-  onChange={setReturQty}
-/>
-                  </label>
-                </div>
-              )}
-            </Modal>
+      <label className="field">
+        <span>Antal att returnera</span>
+        <QtyInput
+          value={returQty}
+          min={1}
+          max={toInt(returRad.antal, 0)}
+          onChange={setReturQty}
+        />
+      </label>
 
+      <div className="muted" style={{ fontSize: 12 }}>
+        Kvar hos laget efter retur:{" "}
+        <strong>
+          {Math.max(0, toInt(returRad.antal, 0) - Math.max(1, toInt(returQty, 1)))}
+        </strong>{" "}
+        st
+      </div>
+    </div>
+  )}
+</Modal>
             {/* ===== ✅ Modal: Ny produkt ===== */}
             <Modal
               open={addProdOpen}
