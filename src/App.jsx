@@ -220,70 +220,7 @@ function downloadXlsx(workbook, filename) {
   a.remove();
   URL.revokeObjectURL(url);
 }
-function stableLagLagerId(lag, huvudgrupp, produkt) {
-  const l = String(lag || "Okänt").trim() || "Okänt";
-  return `${l}::${normKeyPart(huvudgrupp)}::${normKeyPart(produkt)}`;
-}
 
-function migrateLagLagerRows(rows) {
-  const byNewId = new Map(); // newId -> { row, sourceIds: [] }
-  const removes = new Set();
-
-  for (const r of (rows || [])) {
-    const lag = (r?.lag || "Okänt").trim() || "Okänt";
-    const hg = r?.huvudgrupp ?? "";
-    const prod = r?.produkt ?? "";
-
-    const newId = stableLagLagerId(lag, hg, prod);
-    const oldId = String(r?.id ?? "");
-
-    // markera gamla id för borttag om de skiljer
-    if (oldId && oldId !== newId) removes.add(oldId);
-
-    const antal = Math.max(0, toInt(r?.antal, 0));
-
-    if (!byNewId.has(newId)) {
-      byNewId.set(newId, {
-        row: {
-          ...r,
-          id: newId,
-          lag,
-          huvudgrupp: hg,
-          produkt: prod,
-          antal,
-        },
-        sourceIds: oldId ? [oldId] : [],
-      });
-    } else {
-      const entry = byNewId.get(newId);
-      // slå ihop: summera antal
-      entry.row.antal = Math.max(0, toInt(entry.row.antal, 0)) + antal;
-
-      // behåll “bästa” metadata
-      if (!entry.row.utlamningsdatum && r?.utlamningsdatum) entry.row.utlamningsdatum = r.utlamningsdatum;
-      if (!entry.row.kommentar && r?.kommentar) entry.row.kommentar = r.kommentar;
-      if (!entry.row.skapadTid && r?.skapadTid) entry.row.skapadTid = r.skapadTid;
-      if (!entry.row.skapadAv && r?.skapadAv) entry.row.skapadAv = r.skapadAv;
-
-      if (oldId) entry.sourceIds.push(oldId);
-    }
-  }
-
-  const nextRows = Array.from(byNewId.values()).map((x) => x.row);
-
-  // Om flera olika gamla rader mappade till samma stable id -> markera dem också för remove
-  for (const v of byNewId.values()) {
-    for (const sid of v.sourceIds) {
-      if (sid && sid !== v.row.id) removes.add(sid);
-    }
-  }
-
-  return {
-    nextRows,
-    removeIds: Array.from(removes),
-    upserts: nextRows, // vi upsertar hela nya listan (idempotent)
-  };
-}
 /* ================= PIN hashing (local-only) =================
    OBS: inte kryptografiskt starkt (offline/local). Bra nog för PIN i localStorage.
 */
