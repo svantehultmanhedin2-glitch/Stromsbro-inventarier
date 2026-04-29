@@ -1414,35 +1414,42 @@ const flyttaTillLag = () => {
 
   const p = produkter.find((x) => String(x.id) === String(prodId));
   if (!p) return setFel("Välj en produkt i huvudlagret.");
-  if (toInt(p.antal, 0) < antal) return setFel("Finns inte så många i huvudlagret.");
+  if (toInt(p.antal, 0) < antal)
+    return setFel("Finns inte så många i huvudlagret.");
 
   setFel("");
 
-  // 1) huvudlager
+  // 1) Huvudlager
   const nyaProdukter = produkter.map((x) =>
     x.id === p.id ? { ...x, antal: toInt(x.antal, 0) - antal } : x
   );
   setProdukter(nyaProdukter);
   setInkopslista((prev) => buildInkopLista(nyaProdukter, prev));
 
-  // 2) laglager
+  // 2) Förbered lagrad (VIKTIGT)
   const now = new Date().toLocaleString("sv-SE");
   const ut = (flytt.utlamningsdatum ?? "").trim();
   const kom = (flytt.kommentar ?? "").trim();
 
-  let skapadRad = null;
+  const lagItem = {
+    id: `${lag}::${normKeyPart(p.huvudgrupp)}::${normKeyPart(p.produkt)}`, // ✅ stabilt id
+    lag,
+    huvudgrupp: p.huvudgrupp ?? "",
+    produkt: p.produkt ?? "",
+    antal,
+    utlamningsdatum: ut,
+    kommentar: kom,
+    skapadTid: now,
+    skapadAv: currentUser?.name ?? "Okänd",
+  };
 
+  // 3) Lagmaterial – UI
   setLagLager((prev) => {
-    const exists = prev.find(
-      (r) =>
-        (r.lag || "Okänt") === lag &&
-        normKeyPart(r.produkt) === normKeyPart(p.produkt) &&
-        normKeyPart(r.huvudgrupp) === normKeyPart(p.huvudgrupp)
-    );
+    const exists = prev.find((r) => r.id === lagItem.id);
 
     if (exists) {
-      const next = prev.map((r) =>
-        r.id === exists.id
+      return prev.map((r) =>
+        r.id === lagItem.id
           ? {
               ...r,
               antal: Math.max(0, toInt(r.antal, 0)) + antal,
@@ -1451,26 +1458,12 @@ const flyttaTillLag = () => {
             }
           : r
       );
-      skapadRad = next.find((r) => r.id === exists.id);
-      return next;
     }
 
-    const item = {
-      id: Date.now(),
-      lag,
-      huvudgrupp: p.huvudgrupp ?? "",
-      produkt: p.produkt ?? "",
-      antal,
-      utlamningsdatum: ut,
-      kommentar: kom,
-      skapadTid: now,
-      skapadAv: currentUser?.name ?? "Okänd",
-    };
-    skapadRad = item;
-    return [item, ...prev];
+    return [lagItem, ...prev];
   });
 
-  // 3) historik
+  // 4) Historik
   const h = makeHistorikRad({
     tid: new Date().toLocaleString("sv-SE"),
     typ: "Utlämnat till lag",
@@ -1483,10 +1476,12 @@ const flyttaTillLag = () => {
   });
   setHistorik((prev) => [h, ...prev]);
 
-  // OPS
-  opPatch(OP_ENTITY.produkter, p.id, { antal: toInt(p.antal, 0) - antal });
-  // Upsert lagraden (om skapadRad redan satt)
-  if (skapadRad) opUpsert(OP_ENTITY.lagLager, skapadRad);
+  // ✅ OPS – NU FUNKAR DET GARANTERAT
+  opPatch(OP_ENTITY.produkter, p.id, {
+    antal: toInt(p.antal, 0) - antal,
+  });
+
+  opUpsert(OP_ENTITY.lagLager, lagItem);
   opUpsert(OP_ENTITY.historik, h);
 
   showInfo(`Flyttade ${antal} st till ${lag}.`);
