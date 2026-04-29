@@ -1783,6 +1783,7 @@ const angraBestalld = (key) => {
 
 
   /* ================= Inleverans: motta delleverans ================= */
+/* ================= Inleverans: motta delleverans ================= */
 const mottaLeverans = (rowKey, qtyInput) => {
   if (!canSeeInleverans) return;
 
@@ -1798,43 +1799,50 @@ const mottaLeverans = (rowKey, qtyInput) => {
   if (qty <= 0) return setFel("Inget kvar att ta emot.");
 
   setFel("");
+
   const tid = new Date().toLocaleString("sv-SE");
   const av = currentUser?.name ?? "Okänd";
   const kom = String(leveransKommentar ?? "").trim();
 
-  // 1) produkter
-  let prodIdTouched = null;
-  let prodNewQty = null;
+  /* ===== 1) BERÄKNA produktförändring SYNKRONT ===== */
+  const prodIdx = produkter.findIndex(
+    (p) =>
+      normKeyPart(p.produkt) === normKeyPart(row.produkt) &&
+      normKeyPart(p.huvudgrupp) === normKeyPart(row.huvudgrupp)
+  );
 
-  setProdukter((prev) => {
-    const idx = prev.findIndex(
-      (p) =>
-        normKeyPart(p.produkt) === normKeyPart(row.produkt) &&
-        normKeyPart(p.huvudgrupp) === normKeyPart(row.huvudgrupp)
+  let prodId;
+  let prodNewQty;
+  let nyaProdukter;
+
+  if (prodIdx >= 0) {
+    const p = produkter[prodIdx];
+    prodId = p.id;
+    prodNewQty = Math.max(0, toInt(p.antal, 0)) + qty;
+
+    nyaProdukter = produkter.map((x, i) =>
+      i === prodIdx
+        ? { ...x, antal: prodNewQty, lagerplats: leveransLagerplats }
+        : x
     );
-
-    if (idx >= 0) {
-      const nya = [...prev];
-      prodNewQty = Math.max(0, toInt(nya[idx].antal, 0)) + qty;
-      nya[idx] = { ...nya[idx], antal: prodNewQty, lagerplats: leveransLagerplats };
-      prodIdTouched = nya[idx].id;
-      return nya;
-    }
+  } else {
+    prodId = Date.now();
+    prodNewQty = qty;
 
     const ny = {
-      id: Date.now(),
+      id: prodId,
       huvudgrupp: row.huvudgrupp ?? "",
       produkt: row.produkt ?? "",
-      antal: qty,
+      antal: prodNewQty,
       lagerplats: leveransLagerplats,
       beställningspunkt: 0,
     };
-    prodIdTouched = ny.id;
-    prodNewQty = qty;
-    return [ny, ...prev];
-  });
 
-  // 2) inkopslista
+    nyaProdukter = [ny, ...produkter];
+  }
+
+  /* ===== 2) UI: produkter + inköp ===== */
+  setProdukter(nyaProdukter);
   setInkopslista((prev) =>
     prev.map((r) => {
       if (r.key !== rowKey) return r;
@@ -1856,7 +1864,7 @@ const mottaLeverans = (rowKey, qtyInput) => {
     })
   );
 
-  // 3) historik
+  /* ===== 3) Historik ===== */
   const kommentarText = `Inleverans → ${leveransLagerplats}${kom ? ` • ${kom}` : ""}`;
   const h = makeHistorikRad({
     tid,
@@ -1870,16 +1878,20 @@ const mottaLeverans = (rowKey, qtyInput) => {
   });
   setHistorik((prev) => [h, ...prev]);
 
-  // OPS
-  if (prodIdTouched != null) opPatch(OP_ENTITY.produkter, prodIdTouched, { antal: prodNewQty, lagerplats: leveransLagerplats });
+  /* ===== 4) OPS (NU GARANTERAT KORREKT) ===== */
+  opPatch(OP_ENTITY.produkter, prodId, {
+    antal: prodNewQty,
+    lagerplats: leveransLagerplats,
+  });
+
   opPatch(OP_ENTITY.inkopslista, rowKey, {
     mottagetAntal: received + qty,
-    // levererad/levereradTid/levereradAv avgörs av ordered:
     leveranser: [
       { tid, av, antal: qty, lagerplats: leveransLagerplats, kommentar: kom },
       ...(row.leveranser || []),
     ],
   });
+
   opUpsert(OP_ENTITY.historik, h);
 
   showInfo(`Tog emot ${qty} st: ${row.produkt} (offline-säkert).`);
