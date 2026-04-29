@@ -1410,7 +1410,7 @@ const flyttaTillLag = () => {
 
   const prodId = flytt.produktId;
   const antal = Math.max(1, toInt(flytt.antal, 1));
-  const lag = (flytt.lag ?? aktivtLagEff ?? "Okänt").trim() || "Okänt";
+  const lag = (flytt.lag && flytt.lag.trim()) || aktivtLagEff || "Okänt";
 
   const p = produkter.find((x) => String(x.id) === String(prodId));
   if (!p) return setFel("Välj en produkt i huvudlagret.");
