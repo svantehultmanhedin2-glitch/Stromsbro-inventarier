@@ -797,7 +797,56 @@ const makeHistorikRad = useCallback((h) => ({
   ...h,
 }), []);
 
-function stableLagLagerId(lag, huvudgrupp, produkt) {
+
+
+  // ===== Initial load + polling =====
+  useEffect(() => {
+    let cancelled = false;
+
+    (async () => {
+      setCloudStatus((s) => ({ ...s, loading: true }));
+      await reloadFromCloud({ force: true });
+      if (!cancelled) setCloudStatus((s) => ({ ...s, loading: false }));
+    })();
+
+    const id = setInterval(() => {
+      reloadFromCloud(); // silent polling
+    }, 5000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [reloadFromCloud]);
+
+  
+useEffect(() => {
+  const onOnline = () => syncNow();
+  window.addEventListener("online", onOnline);
+  return () => window.removeEventListener("online", onOnline);
+}, [syncNow]);
+
+
+  /* ===== Behörigheter ===== */
+  const isAdmin = currentUser?.role === "Admin";
+  const isMA = currentUser?.role === "Materialansvarig";
+  const isLedare = currentUser?.role === "Ledare";
+
+  const canEditUsers = isAdmin;
+  const canSeeInkop = isAdmin || isMA;
+  const canSeeInleverans = isAdmin || isMA;
+  const canMoveToInkop = isAdmin || isMA;
+  const canUtlamna = isAdmin || isMA;
+  const canEditHuvudlager = isAdmin || isMA;
+  const canImportExport = isAdmin || isMA;
+
+  /* ===== App state ===== */
+  const { info, show: showInfo } = useToast(2500);
+  const [fel, setFel] = useState("");
+  const [vy, setVy] = useState(saved?.vy ?? "lager");
+  const [sok, setSok] = useState("");
+
+  function stableLagLagerId(lag, huvudgrupp, produkt) {
   const l = String(lag || "Okänt").trim() || "Okänt";
   return `${l}::${normKeyPart(huvudgrupp)}::${normKeyPart(produkt)}`;
 }
@@ -861,55 +910,6 @@ function migrateLagLagerRows(rows) {
     upserts: nextRows, // vi upsertar hela nya listan (idempotent)
   };
 }
-
-  // ===== Initial load + polling =====
-  useEffect(() => {
-    let cancelled = false;
-
-    (async () => {
-      setCloudStatus((s) => ({ ...s, loading: true }));
-      await reloadFromCloud({ force: true });
-      if (!cancelled) setCloudStatus((s) => ({ ...s, loading: false }));
-    })();
-
-    const id = setInterval(() => {
-      reloadFromCloud(); // silent polling
-    }, 5000);
-
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
-  }, [reloadFromCloud]);
-
-  
-useEffect(() => {
-  const onOnline = () => syncNow();
-  window.addEventListener("online", onOnline);
-  return () => window.removeEventListener("online", onOnline);
-}, [syncNow]);
-
-
-  /* ===== Behörigheter ===== */
-  const isAdmin = currentUser?.role === "Admin";
-  const isMA = currentUser?.role === "Materialansvarig";
-  const isLedare = currentUser?.role === "Ledare";
-
-  const canEditUsers = isAdmin;
-  const canSeeInkop = isAdmin || isMA;
-  const canSeeInleverans = isAdmin || isMA;
-  const canMoveToInkop = isAdmin || isMA;
-  const canUtlamna = isAdmin || isMA;
-  const canEditHuvudlager = isAdmin || isMA;
-  const canImportExport = isAdmin || isMA;
-
-  /* ===== App state ===== */
-  const { info, show: showInfo } = useToast(2500);
-  const [fel, setFel] = useState("");
-  const [vy, setVy] = useState(saved?.vy ?? "lager");
-  const [sok, setSok] = useState("");
-
-  
 
   /* ===== Qty per product ===== */
   const [qtyMap, setQtyMap] = useState(() =>
